@@ -1,0 +1,6 @@
+# Your own usage snapshots and fitted caps — personal telemetry, never commit
+history.jsonl
+calibration.json
+
+__pycache__/
+*.pyc

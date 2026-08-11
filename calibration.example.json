@@ -1,27 +1,44 @@
 {
-  "provider": "opencode-go",
-  "calibrated_at": "2026-01-01T00:00:00+00:00",
-  "windows": {
-    "session": {
-      "cap": 2.75,
-      "observed_pct": 42.0,
-      "local_spend": 1.15,
-      "at": "2026-01-01T00:00:00+00:00"
+  "version": 2,
+  "accounts": {
+    "opencode": {
+      "provider": "opencode-go",
+      "calibrated_at": "2026-01-01T00:00:00+00:00",
+      "windows": {
+        "session": {
+          "cap": 2.75,
+          "observed_pct": 42.0,
+          "local_spend": 1.15,
+          "at": "2026-01-01T00:00:00+00:00"
+        },
+        "week": {
+          "reset_at": "2026-01-05T00:00:00+00:00",
+          "cap": 7.8,
+          "observed_pct": 87.0,
+          "local_spend": 6.79,
+          "at": "2026-01-01T00:00:00+00:00"
+        },
+        "month": {
+          "anchor_day": 4,
+          "anchor_time": "01:00",
+          "cap": 19.15,
+          "observed_pct": 6.0,
+          "local_spend": 1.15,
+          "at": "2026-01-01T00:00:00+00:00"
+        }
+      }
     },
-    "week": {
-      "reset_at": "2026-01-05T00:00:00+00:00",
-      "cap": 7.8,
-      "observed_pct": 87.0,
-      "local_spend": 6.79,
-      "at": "2026-01-01T00:00:00+00:00"
-    },
-    "month": {
-      "anchor_day": 4,
-      "anchor_time": "01:00",
-      "cap": 19.15,
-      "observed_pct": 6.0,
-      "local_spend": 1.15,
-      "at": "2026-01-01T00:00:00+00:00"
+    "opencode-work": {
+      "provider": "opencode-go",
+      "calibrated_at": "2026-01-01T00:00:00+00:00",
+      "windows": {
+        "session": {
+          "cap": 5.4,
+          "observed_pct": 21.0,
+          "local_spend": 1.13,
+          "at": "2026-01-01T00:00:00+00:00"
+        }
+      }
     }
   }
 }

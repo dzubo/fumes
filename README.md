@@ -33,15 +33,65 @@ git clone git@github.com:dzubo/fumes.git && cd fumes
 ./fumes.py                  # table
 ./fumes.py --json           # normalized records, for a statusline or cron
 ./fumes.py -p claude        # one provider (repeatable)
+./fumes.py -a work          # one account (repeatable)
 ./fumes.py --no-history     # skip the snapshot append
 ```
+
+## Accounts
+
+Every provider can be configured more than once — a work and a personal Claude
+Code login, two OpenCode data dirs. Copy `settings.example.json` to
+`settings.json` beside the script and list them:
+
+```json
+{
+  "accounts": [
+    { "name": "claude",      "provider": "claude",   "folder": "~/.claude",                "binary": "claude" },
+    { "name": "claude-work", "provider": "claude",   "folder": "~/.claude-work",           "binary": "claude" },
+    { "name": "opencode",    "provider": "opencode", "folder": "~/.local/share/opencode",  "binary": "opencode" }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `name` | What the table calls it and what `-a` selects. Must be unique — it also keys the calibration. |
+| `provider` | `claude` or `opencode`. The adapter that knows how to read the folder. |
+| `folder` | Where that provider keeps its state — Claude Code's config dir (holding `.credentials.json`), OpenCode's data dir (holding `auth.json` and `opencode*.db`). `~` and `$VARS` expand. |
+| `binary` | The CLI that owns the folder. **Never executed** — it appears in hints, e.g. which command to run to refresh an expired token. |
+
+Only `provider` is required; the rest fall back to that provider's defaults.
+Everything an account needs to be told apart lives in its folder, so a second
+login is a settings entry, not a code change.
+
+Accounts are read from `$FUMES_SETTINGS`, else `settings.json` beside the
+script, else `~/.config/fumes/settings.json`. **With no settings file at all,
+one account per provider is assumed at the usual locations** — which is exactly
+what earlier versions did, so nothing needs configuring to keep working.
+
+Each account is fetched independently: one that can't be read prints its error
+under its own heading and the rest still print.
+
+```
+$ ./fumes.py
+claude-work (claude)
+  5-hour session  ████████████████  100%         resets in 2h 45m
+  7-day           █████████░░░░░░░   57%         resets in 1d 1h
+claude-old (claude)
+  OAuth token expired at 22:16 - run `CLAUDE_CONFIG_DIR=/home/you/.claude-old claude` to refresh
+opencode (opencode)
+  go 5-hour       ██████░░░░░░░░░░   35%  $0.96  resets in 4h 4m    cal today
+```
+
+The heading is the account name; the provider follows in parentheses unless the
+name already is the provider.
 
 ## Providers
 
 | Provider | Source | Reads |
 |---|---|---|
-| `claude` | **live** | `GET api.anthropic.com/api/oauth/usage` with the token in `~/.claude/.credentials.json` |
-| `opencode` | **local** | `~/.local/share/opencode/opencode*.db` (respects `$OPENCODE_DATA_DIR` / `$XDG_DATA_HOME`) |
+| `claude` | **live** | `GET api.anthropic.com/api/oauth/usage` with the token in `<folder>/.credentials.json` (default `$CLAUDE_CONFIG_DIR`, else `~/.claude`) |
+| `opencode` | **local** | `<folder>/opencode*.db` (default `$OPENCODE_DATA_DIR`, else `$XDG_DATA_HOME/opencode`, else `~/.local/share/opencode`) |
 
 **Claude** reuses the OAuth token Claude Code already maintains. That file is read
 **read-only** on purpose: Claude Code owns it and refreshes the ~3h token on use,
@@ -79,9 +129,15 @@ hand them over:
 ```bash
 ./fumes.py calibrate --rolling 42 --weekly 87 --monthly 6 \
     --weekly-resets "5d 21h" --monthly-resets "30d 23h"
-./fumes.py calibrate --show     # what's stored
-./fumes.py calibrate --clear    # back to assumed caps
+./fumes.py calibrate --show          # what's stored, for every account
+./fumes.py calibrate --clear         # back to assumed caps
+./fumes.py calibrate -a work ...     # which account you're reading off the console
 ```
+
+Calibration is **per account**: two OpenCode logins are metered separately and
+each console shows its own percentages, so each gets its own caps and window
+anchors. `-a` is optional while only one OpenCode account is configured, and
+required once there are several. `--show` without `-a` prints them all.
 
 Each percentage is divided into the local spend for that window to get the
 **effective cap** — the local-dollar figure that reproduces the console's number.
@@ -104,12 +160,14 @@ Guard rails, because this is a fit to a single observation:
 Nothing leaves your machine except one request to `api.anthropic.com` — the
 issuer of the token it sends. No telemetry, no third parties.
 
-Two local files, both gitignored:
+Three local files, all gitignored:
 
 - `history.jsonl` — one snapshot per report run. Kept because the Claude
   percentages exist nowhere else once a window rolls.
-- `calibration.json` — the fitted caps and window anchors. See
+- `calibration.json` — the fitted caps and window anchors, keyed by account. See
   `calibration.example.json`.
+- `settings.json` — your account list. Paths and login names, no secrets, but
+  personal. See `settings.example.json`.
 
 Credentials are read at call time, used in an `Authorization` header, and never
 written to either file or to any error message.
@@ -123,7 +181,11 @@ written to either file or to any error message.
 - The Go plan caps in `DEFAULT_CAPS` are community-observed starting points and
   are — as the table above shows — wrong. Calibrate.
 - Only Claude and OpenCode so far. Adding a provider means one function returning
-  `Record`s and one entry in `PROVIDERS`.
+  `Record`s plus an entry in `PROVIDERS` and `PROVIDER_DEFAULTS`; adding another
+  *account* of an existing provider is settings only.
+- The default Claude account now follows `$CLAUDE_CONFIG_DIR` when it is set,
+  where it used to always read `~/.claude`. If your shell exports it, that's the
+  account you'll see — name both folders in `settings.json` to see both.
 
 ## License
 

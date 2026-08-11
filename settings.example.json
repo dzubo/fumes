@@ -1,0 +1,22 @@
+{
+  "accounts": [
+    {
+      "name": "claude",
+      "provider": "claude",
+      "folder": "~/.claude",
+      "binary": "claude"
+    },
+    {
+      "name": "claude-work",
+      "provider": "claude",
+      "folder": "~/.claude-work",
+      "binary": "claude"
+    },
+    {
+      "name": "opencode",
+      "provider": "opencode",
+      "folder": "~/.local/share/opencode",
+      "binary": "opencode"
+    }
+  ]
+}

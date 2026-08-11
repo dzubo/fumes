@@ -10,20 +10,31 @@ Providers:
                       usage API, so windows and caps are applied client-side and
                       are only as good as the last calibration (see below).
 
+Accounts:
+    Each provider can be configured any number of times - a work and a personal
+    Claude Code login, two OpenCode data dirs - by listing them in settings.json
+    beside this file. An account is a name, a provider, and the folder that
+    provider keeps its state in, so two accounts never read each other's numbers.
+    See settings.example.json. Without a settings.json, one account per provider
+    is assumed at the usual locations, which is what earlier versions did.
+
 Usage:
     ./fumes.py                  # table
     ./fumes.py --json           # normalized records
-    ./fumes.py -p claude        # one provider
+    ./fumes.py -p claude        # one provider (repeatable)
+    ./fumes.py -a work          # one account (repeatable)
     ./fumes.py --no-history     # don't append a snapshot
 
     # teach it the real OpenCode Go numbers, read off console.opencode.ai
-    ./fumes.py calibrate --rolling 42 --weekly 87 --monthly 6 \
+    ./fumes.py calibrate -a opencode --rolling 42 --weekly 87 --monthly 6 \
         --weekly-resets "5d 21h" --monthly-resets "30d 23h"
-    ./fumes.py calibrate --show
-    ./fumes.py calibrate --clear
+    ./fumes.py calibrate --show          # every account
+    ./fumes.py calibrate -a opencode --clear
 
 Every report run appends a snapshot to history.jsonl beside this file (gitignored)
-so burn-rate and trends are recoverable later.
+so burn-rate and trends are recoverable later. Calibration is stored per account
+in calibration.json, because two accounts on the same plan still have their own
+caps.
 
 Dependencies:
     pip install httpx
@@ -46,9 +57,11 @@ import httpx
 HERE = Path(__file__).resolve().parent
 HISTORY_FILE = HERE / "history.jsonl"
 CALIBRATION_FILE = HERE / "calibration.json"
+SETTINGS_NAME = "settings.json"
+SETTINGS_ENV = "FUMES_SETTINGS"
 TIMEOUT = 15.0
 
-CLAUDE_CREDENTIALS = Path.home() / ".claude" / ".credentials.json"
+CLAUDE_CREDENTIALS_NAME = ".credentials.json"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_BETA = "oauth-2025-04-20"
 
@@ -69,11 +82,26 @@ WINDOW_FLAGS = {"session": "rolling", "week": "weekly", "month": "monthly"}
 
 
 class ProviderError(Exception):
-    """A provider could not be read. Never fatal - other providers still print."""
+    """An account could not be read. Never fatal - the other accounts still print."""
+
+
+class ConfigError(Exception):
+    """settings.json is unusable. Fatal: guessing at a broken config is worse."""
+
+
+@dataclass(frozen=True)
+class Account:
+    """One login of one provider. `folder` is where that provider keeps its state."""
+
+    name: str  # what the table and -a call it; unique across the config
+    provider: str
+    folder: Path
+    binary: str  # only ever named in hints, never executed
 
 
 @dataclass
 class Record:
+    account: str
     provider: str
     window: str  # stable key: 5h | 7d | session | week | month
     label: str  # human label for the table
@@ -92,12 +120,30 @@ class Record:
 # --------------------------------------------------------------------------- #
 
 
-def fetch_claude() -> list[Record]:
-    """Read the OAuth token Claude Code already maintains, then ask the server."""
+def claude_config_dir() -> Path:
+    """Where Claude Code keeps credentials when no account overrides it."""
+    if env := os.environ.get("CLAUDE_CONFIG_DIR"):
+        return Path(env)
+    return Path.home() / ".claude"
+
+
+def _refresh_hint(account: Account) -> str:
+    """The command that re-mints this account's token. Printed, never run."""
+    if account.folder == claude_config_dir():
+        return account.binary
+    return f"CLAUDE_CONFIG_DIR={account.folder} {account.binary}"
+
+
+def fetch_claude(account: Account, _calibration: dict) -> list[Record]:
+    """Read the OAuth token Claude Code already maintains, then ask the server.
+
+    Nothing to calibrate here - the server hands over its own percentages.
+    """
+    credentials = account.folder / CLAUDE_CREDENTIALS_NAME
     try:
-        creds = json.loads(CLAUDE_CREDENTIALS.read_text())["claudeAiOauth"]
+        creds = json.loads(credentials.read_text())["claudeAiOauth"]
     except FileNotFoundError:
-        raise ProviderError(f"no credentials at {CLAUDE_CREDENTIALS} - is Claude Code installed?")
+        raise ProviderError(f"no credentials at {credentials} - is Claude Code set up there?")
     except (KeyError, json.JSONDecodeError) as exc:
         raise ProviderError(f"unreadable credentials: {exc}")
 
@@ -106,7 +152,9 @@ def fetch_claude() -> list[Record]:
     expires_at = creds.get("expiresAt")
     if expires_at and expires_at / 1000 <= datetime.now(timezone.utc).timestamp():
         when = datetime.fromtimestamp(expires_at / 1000).strftime("%H:%M")
-        raise ProviderError(f"OAuth token expired at {when} - run any Claude Code command to refresh")
+        raise ProviderError(
+            f"OAuth token expired at {when} - run `{_refresh_hint(account)}` to refresh"
+        )
 
     headers = {
         "Authorization": f"Bearer {creds['accessToken']}",
@@ -130,6 +178,7 @@ def fetch_claude() -> list[Record]:
         used = float(block.get("utilization", 0.0))
         records.append(
             Record(
+                account=account.name,
                 provider="claude",
                 window=window,
                 label=label,
@@ -151,6 +200,7 @@ def fetch_claude() -> list[Record]:
         cap = _minor(spend.get("limit")) if spend.get("limit") else None
         records.append(
             Record(
+                account=account.name,
                 provider="claude",
                 window="extra",
                 label="extra usage",
@@ -192,17 +242,36 @@ def _minor(money: dict) -> float:
 # This is a fit to one observation, not a discovered constant. It drifts.
 # Recalibrate when the console and the table disagree; every record says how old
 # its calibration is.
+#
+# The fit is per account: two OpenCode logins are metered separately, and each
+# one's console shows its own percentages. So calibration.json is keyed by
+# account name.
+
+CALIBRATION_VERSION = 2
 
 
-def load_calibration() -> dict:
+def load_calibration(accounts: list[Account] | None = None) -> dict[str, dict]:
+    """{account name: calibration block}, migrating the old single-account file."""
     try:
-        return json.loads(CALIBRATION_FILE.read_text())
+        data = json.loads(CALIBRATION_FILE.read_text())
     except (OSError, json.JSONDecodeError):
         return {}
+    if isinstance(data.get("accounts"), dict):
+        return data["accounts"]
+    if "windows" in data:
+        # Written before accounts existed, so it describes whichever OpenCode
+        # account came first - back then there could only be the one.
+        owner = next((a.name for a in accounts or [] if a.provider == "opencode"), "opencode")
+        return {owner: data}
+    return {}
 
 
-def save_calibration(data: dict) -> None:
-    CALIBRATION_FILE.write_text(json.dumps(data, indent=2) + "\n")
+def save_calibration(calibrations: dict[str, dict]) -> None:
+    if not calibrations:
+        CALIBRATION_FILE.unlink(missing_ok=True)
+        return
+    payload = {"version": CALIBRATION_VERSION, "accounts": calibrations}
+    CALIBRATION_FILE.write_text(json.dumps(payload, indent=2) + "\n")
 
 
 # The unit must not run into another letter ('30d23h' is two tokens, '30 dogs' is
@@ -284,6 +353,7 @@ def _monthly_bounds(now: datetime, config: dict) -> tuple[datetime, datetime]:
 
 
 def opencode_data_dir() -> Path:
+    """Where OpenCode keeps its databases when no account overrides it."""
     if env := os.environ.get("OPENCODE_DATA_DIR"):
         return Path(env)
     if xdg := os.environ.get("XDG_DATA_HOME"):
@@ -359,12 +429,11 @@ def _read_messages(db: Path, floor_ms: int):
         conn.close()
 
 
-def fetch_opencode() -> list[Record]:
+def fetch_opencode(account: Account, calibration: dict) -> list[Record]:
     """Roll up opencode's own per-message cost accounting into the plan windows."""
-    data_dir = opencode_data_dir()
+    data_dir = account.folder
     dbs = _opencode_dbs(data_dir)
     auth = _opencode_auth(data_dir)
-    calibration = load_calibration()
     windows = calibration.get("windows", {})
     age = _calibration_age(calibration)
 
@@ -391,6 +460,7 @@ def fetch_opencode() -> list[Record]:
                 resets = datetime.fromtimestamp(first + hours * 3600, timezone.utc) if first else None
             records.append(
                 Record(
+                    account=account.name,
                     provider="opencode",
                     window=window,
                     label=label,
@@ -408,6 +478,7 @@ def fetch_opencode() -> list[Record]:
         used = spend.get("opencode", "calendar_month")
         records.append(
             Record(
+                account=account.name,
                 provider="opencode",
                 window="month",
                 label="zen month",
@@ -436,20 +507,167 @@ def _calibration_age(calibration: dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# accounts - settings.json
+# --------------------------------------------------------------------------- #
+#
+# A provider is code; an account is one login of it. Everything a provider needs
+# to tell one login from another lives in a folder - ~/.claude for Claude Code,
+# ~/.local/share/opencode for OpenCode - so an account is little more than a name
+# pointing at a folder. Adding a second Claude Code login is therefore a settings
+# entry, not a code change.
+
+PROVIDERS = {"claude": fetch_claude, "opencode": fetch_opencode}
+
+# Per provider: where its state lives by default, and the CLI that owns it.
+PROVIDER_DEFAULTS = {
+    "claude": (claude_config_dir, "claude"),
+    "opencode": (opencode_data_dir, "opencode"),
+}
+
+
+def settings_file() -> Path | None:
+    """$FUMES_SETTINGS, else settings.json beside the script, else under XDG."""
+    if env := os.environ.get(SETTINGS_ENV):
+        path = Path(env).expanduser()
+        if not path.exists():
+            raise ConfigError(f"{SETTINGS_ENV} points at {path}, which does not exist")
+        return path
+    xdg = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    for candidate in (HERE / SETTINGS_NAME, xdg / "fumes" / SETTINGS_NAME):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def default_accounts() -> list[Account]:
+    """No settings.json: one account per provider, where it has always looked."""
+    return [
+        Account(name=provider, provider=provider, folder=folder(), binary=binary)
+        for provider, (folder, binary) in PROVIDER_DEFAULTS.items()
+    ]
+
+
+def load_accounts() -> list[Account]:
+    path = settings_file()
+    if path is None:
+        return default_accounts()
+    try:
+        data = json.loads(path.read_text())
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc}")
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{path} is not valid JSON: {exc}")
+
+    entries = data.get("accounts")
+    if not isinstance(entries, list) or not entries:
+        raise ConfigError(f'{path} needs a non-empty "accounts" list - see settings.example.json')
+
+    accounts: list[Account] = []
+    for index, entry in enumerate(entries):
+        account = _read_account(entry, f"{path} accounts[{index}]")
+        # Names key the calibration file and select on the command line, so a
+        # duplicate would silently point two logins at one set of caps.
+        if any(existing.name == account.name for existing in accounts):
+            raise ConfigError(f"duplicate account name {account.name!r} in {path}")
+        accounts.append(account)
+    return accounts
+
+
+def _read_account(entry: object, where: str) -> Account:
+    if not isinstance(entry, dict):
+        raise ConfigError(f"{where} is not an object")
+    provider = entry.get("provider")
+    if provider not in PROVIDERS:
+        known = ", ".join(sorted(PROVIDERS))
+        raise ConfigError(f"{where} has provider {provider!r} - known providers are {known}")
+    folder_default, binary_default = PROVIDER_DEFAULTS[provider]
+    folder = entry.get("folder")
+    return Account(
+        name=str(entry.get("name") or provider),
+        provider=provider,
+        folder=_expand(folder) if folder else folder_default(),
+        binary=str(entry.get("binary") or binary_default),
+    )
+
+
+def _expand(folder: object) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(str(folder))))
+
+
+def select_accounts(accounts: list[Account], names: list[str] | None,
+                    providers: list[str] | None) -> list[Account]:
+    """Apply -a and -p, keeping the order the settings file declared."""
+    if names:
+        known = {account.name for account in accounts}
+        if unknown := [name for name in names if name not in known]:
+            raise ConfigError(
+                f"no account named {', '.join(repr(n) for n in unknown)} - "
+                f"configured: {', '.join(sorted(known))}"
+            )
+    chosen = [
+        account for account in accounts
+        if (not names or account.name in names)
+        and (not providers or account.provider in providers)
+    ]
+    if not chosen:
+        raise ConfigError("no account matches those filters")
+    return chosen
+
+
+def calibration_account(accounts: list[Account], name: str | None) -> Account:
+    """Which account `calibrate` is talking about. Only OpenCode has caps to fit."""
+    candidates = [account for account in accounts if account.provider == "opencode"]
+    if not candidates:
+        raise ConfigError("no opencode account configured - nothing to calibrate")
+    if name:
+        for account in candidates:
+            if account.name == name:
+                return account
+        raise ConfigError(
+            f"no opencode account named {name!r} - "
+            f"configured: {', '.join(a.name for a in candidates)}"
+        )
+    if len(candidates) > 1:
+        raise ConfigError(
+            "several opencode accounts configured - pick one with -a: "
+            + ", ".join(a.name for a in candidates)
+        )
+    return candidates[0]
+
+
+# --------------------------------------------------------------------------- #
 # calibrate command
 # --------------------------------------------------------------------------- #
 
 
 def calibrate(args) -> int:
-    if args.clear:
-        CALIBRATION_FILE.unlink(missing_ok=True)
-        print(f"calibration cleared - back to assumed caps {DEFAULT_CAPS}")
+    accounts = load_accounts()
+    calibrations = load_calibration(accounts)
+
+    # `--show` without an account is the only whole-file view: everything at once.
+    if args.show and not args.account:
+        if not calibrations:
+            print("no calibration yet - run `calibrate --rolling N --weekly N --monthly N`")
+            return 0
+        print(json.dumps(calibrations, indent=2))
         return 0
 
-    calibration = load_calibration()
+    account = calibration_account(accounts, args.account)
+    calibration = calibrations.get(account.name, {})
+
+    if args.clear:
+        if not calibration:
+            print(f"{account.name} was never calibrated - nothing to clear")
+            return 0
+        calibrations.pop(account.name, None)
+        save_calibration(calibrations)
+        print(f"calibration cleared for {account.name} - back to assumed caps {DEFAULT_CAPS}")
+        return 0
+
     if args.show:
         if not calibration:
-            print("no calibration yet - run `calibrate --rolling N --weekly N --monthly N`")
+            print(f"no calibration yet for {account.name} - "
+                  "run `calibrate --rolling N --weekly N --monthly N`")
             return 0
         print(json.dumps(calibration, indent=2))
         return 0
@@ -476,7 +694,7 @@ def calibrate(args) -> int:
         moved.append(f"monthly window now anchored on day {reset.day} at {reset:%H:%M} UTC")
 
     bounds = window_bounds(now, calibration)
-    spend = read_spend(_opencode_dbs(opencode_data_dir()), bounds)
+    spend = read_spend(_opencode_dbs(account.folder), bounds)
 
     rows, skipped, coarse = [], [], []
     for window, percent in observed.items():
@@ -511,9 +729,11 @@ def calibrate(args) -> int:
 
     calibration["provider"] = "opencode-go"
     calibration["calibrated_at"] = now.isoformat()
-    save_calibration(calibration)
+    calibrations[account.name] = calibration
+    save_calibration(calibrations)
 
-    print(f"calibrated against the OpenCode console at {now.astimezone():%Y-%m-%d %H:%M}\n")
+    print(f"calibrated {account.name} against the OpenCode console "
+          f"at {now.astimezone():%Y-%m-%d %H:%M}\n")
     if rows:
         print(f"  {'window':<8} {'local':>8} {'console':>8} {'effective cap':>14} {'was':>9}")
         for window, used, percent, cap, was in rows:
@@ -534,8 +754,6 @@ def calibrate(args) -> int:
 # --------------------------------------------------------------------------- #
 # rendering
 # --------------------------------------------------------------------------- #
-
-PROVIDERS = {"claude": fetch_claude, "opencode": fetch_opencode}
 
 BAR_WIDTH = 16
 GREEN, YELLOW, RED, DIM, RESET = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
@@ -567,16 +785,25 @@ def _until(iso: str | None) -> str:
     return f"{hours}h {minutes}m" if hours else f"{minutes}m"
 
 
-def _basis(rec: Record) -> str:
+def _basis(rec: Record, ages: dict[str, str]) -> str:
     """How much to trust this row: server-given, calibrated, or guessed."""
     if rec.source == "live":
         return ""
     if rec.limit is None:
         return "uncapped"
-    return f"cal {_calibration_age(load_calibration())}" if rec.calibrated else "est"
+    return f"cal {ages.get(rec.account, 'never')}" if rec.calibrated else "est"
 
 
-def render_table(records: list[Record], errors: list[tuple[str, str]], color: bool) -> str:
+def _heading(account: Account, color: bool) -> str:
+    """The account's name, plus its provider when the name doesn't give it away."""
+    if account.name == account.provider:
+        return account.name
+    dim, undim = (DIM, RESET) if color else ("", "")
+    return f"{account.name} {dim}({account.provider}){undim}"
+
+
+def render_table(accounts: list[Account], records: list[Record],
+                 errors: list[tuple[Account, str]], color: bool, ages: dict[str, str]) -> str:
     cells = []
     for rec in records:
         cells.append((
@@ -585,50 +812,58 @@ def render_table(records: list[Record], errors: list[tuple[str, str]], color: bo
             f"{rec.pct:.0f}%" if rec.pct is not None else "",
             f"${rec.used:.2f}" if rec.unit == "usd" else "",
             f"resets in {_until(rec.resets_at)}" if rec.resets_at else "",
-            _basis(rec),
+            _basis(rec, ages),
             _color(rec.pct, color),
         ))
     widths = [max((len(cell[i]) for cell in cells), default=0) for i in range(6)]
 
     lines = []
-    for provider in PROVIDERS:
-        rows = [(rec, cell) for rec, cell in zip(records, cells) if rec.provider == provider]
-        if not rows:
+    failed = {account.name: message for account, message in errors}
+    for account in accounts:
+        rows = [cell for rec, cell in zip(records, cells) if rec.account == account.name]
+        if not rows and account.name not in failed:
             continue
-        lines.append(provider)
-        for _, cell in rows:
+        lines.append(_heading(account, color))
+        for cell in rows:
             tint, off = (cell[6], RESET) if cell[6] else ("", "")
             dim, undim = (DIM, RESET) if color else ("", "")
             lines.append(
                 f"  {cell[0]:<{widths[0]}}  {tint}{cell[1]}{off}  {cell[2]:>{widths[2]}}  "
                 f"{cell[3]:>{widths[3]}}  {dim}{cell[4]:<{widths[4]}}  {cell[5]}{undim}".rstrip()
             )
-    for provider, message in errors:
-        lines.append(f"{provider}\n  {RED if color else ''}{message}{RESET if color else ''}")
+        if message := failed.get(account.name):
+            lines.append(f"  {RED if color else ''}{message}{RESET if color else ''}")
     return "\n".join(lines) if lines else "nothing to report"
 
 
-def snapshot(records: list[Record], errors: list[tuple[str, str]]) -> dict:
-    calibration = load_calibration()
+def snapshot(accounts: list[Account], records: list[Record],
+             errors: list[tuple[Account, str]], calibrations: dict[str, dict]) -> dict:
     return {
         "ts": datetime.now(timezone.utc).isoformat(),
+        "accounts": [
+            {"name": a.name, "provider": a.provider, "folder": str(a.folder)} for a in accounts
+        ],
         "records": [asdict(r) for r in records],
-        "errors": [{"provider": p, "message": m} for p, m in errors],
-        "calibrated_at": calibration.get("calibrated_at"),
+        "errors": [{"account": a.name, "provider": a.provider, "message": m} for a, m in errors],
+        "calibrated_at": {
+            name: block.get("calibrated_at") for name, block in calibrations.items()
+        },
     }
 
 
 def report(args) -> int:
-    wanted = args.provider or list(PROVIDERS)
-    records: list[Record] = []
-    errors: list[tuple[str, str]] = []
-    for name in wanted:
-        try:
-            records.extend(PROVIDERS[name]())
-        except ProviderError as exc:
-            errors.append((name, str(exc)))
+    accounts = select_accounts(load_accounts(), args.account, args.provider)
+    calibrations = load_calibration(accounts)
 
-    payload = snapshot(records, errors)
+    records: list[Record] = []
+    errors: list[tuple[Account, str]] = []
+    for account in accounts:
+        try:
+            records.extend(PROVIDERS[account.provider](account, calibrations.get(account.name, {})))
+        except ProviderError as exc:
+            errors.append((account, str(exc)))
+
+    payload = snapshot(accounts, records, errors, calibrations)
     if not args.no_history:
         with HISTORY_FILE.open("a") as handle:
             handle.write(json.dumps(payload) + "\n")
@@ -636,7 +871,8 @@ def report(args) -> int:
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
-        print(render_table(records, errors, color=sys.stdout.isatty()))
+        ages = {name: _calibration_age(block) for name, block in calibrations.items()}
+        print(render_table(accounts, records, errors, sys.stdout.isatty(), ages))
     return 1 if errors and not records else 0
 
 
@@ -647,11 +883,14 @@ def main() -> int:
     show = sub.add_parser("report", help="print current usage (default)")
     show.add_argument("-p", "--provider", choices=sorted(PROVIDERS), action="append",
                       help="limit to one provider (repeatable)")
+    show.add_argument("-a", "--account", action="append",
+                      help="limit to one configured account (repeatable)")
     show.add_argument("--json", action="store_true", help="emit normalized records")
     show.add_argument("--no-history", action="store_true", help="skip the history.jsonl snapshot")
     show.set_defaults(func=report)
 
     fit = sub.add_parser("calibrate", help="fit OpenCode Go caps to the console's percentages")
+    fit.add_argument("-a", "--account", help="which opencode account (needed if you have several)")
     fit.add_argument("--rolling", type=float, help="rolling-window %% shown on the console")
     fit.add_argument("--weekly", type=float, help="weekly %% shown on the console")
     fit.add_argument("--monthly", type=float, help="monthly %% shown on the console")
@@ -669,7 +908,7 @@ def main() -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (ProviderError, ValueError) as exc:
+    except (ProviderError, ConfigError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

@@ -35,6 +35,7 @@ git clone git@github.com:dzubo/fumes.git && cd fumes
 ./fumes.py -p claude        # one provider (repeatable)
 ./fumes.py -a work          # one account (repeatable)
 ./fumes.py --no-history     # skip the snapshot append
+./fumes.py --version        # also stamped into every history.jsonl line
 ```
 
 ## Accounts
@@ -143,6 +144,21 @@ Each percentage is divided into the local spend for that window to get the
 **effective cap** — the local-dollar figure that reproduces the console's number.
 The optional countdowns move the window boundaries, and are applied *first*: a cap
 fitted over the wrong window is meaningless. Results land in `calibration.json`.
+
+Until you do, the table says so under the account's rows — an uncalibrated cap
+isn't a rounding error, it has measured 3–4× too high, which makes the bar read
+comfortably low exactly when it shouldn't:
+
+```
+fresh-install (opencode)
+  go 5-hour  █░░░░░░░░░░░░░░░   8%   $0.96  resets in 3h 49m   est
+  ! caps are assumed, not measured - typically 3-4x too high, so these read low.
+    Read the percentages off console.opencode.ai, then:
+    ./fumes.py calibrate -a fresh-install --rolling N --weekly N --monthly N
+```
+
+That same $0.96, against caps fitted to a real console reading, is **35%**. A
+calibration older than 14 days gets its own line asking you to recheck it.
 
 Guard rails, because this is a fit to a single observation:
 

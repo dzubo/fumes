@@ -24,6 +24,7 @@ Usage:
     ./fumes.py -p claude        # one provider (repeatable)
     ./fumes.py -a work          # one account (repeatable)
     ./fumes.py --no-history     # don't append a snapshot
+    ./fumes.py --version        # also stamped into every history.jsonl line
 
     # teach it the real OpenCode Go numbers, read off console.opencode.ai
     ./fumes.py calibrate -a opencode --rolling 42 --weekly 87 --monthly 6 \
@@ -60,6 +61,10 @@ CALIBRATION_FILE = HERE / "calibration.json"
 SETTINGS_NAME = "settings.json"
 SETTINGS_ENV = "FUMES_SETTINGS"
 TIMEOUT = 15.0
+
+# Stamped into every history.jsonl snapshot: the file has already changed shape
+# once, so a reader shouldn't have to sniff which version wrote a given line.
+VERSION = "0.2.0"
 
 CLAUDE_CREDENTIALS_NAME = ".credentials.json"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -496,11 +501,17 @@ def fetch_opencode(account: Account, calibration: dict) -> list[Record]:
     return records
 
 
-def _calibration_age(calibration: dict) -> str:
+def _calibration_days(calibration: dict) -> int | None:
     stamp = calibration.get("calibrated_at")
     if not stamp:
+        return None
+    return (datetime.now(timezone.utc) - datetime.fromisoformat(stamp)).days
+
+
+def _calibration_age(calibration: dict) -> str:
+    days = _calibration_days(calibration)
+    if days is None:
         return "never"
-    days = (datetime.now(timezone.utc) - datetime.fromisoformat(stamp)).days
     if days >= CALIBRATION_STALE_DAYS:
         return f"{days}d ago, stale"
     return "today" if days < 1 else f"{days}d ago"
@@ -794,6 +805,31 @@ def _basis(rec: Record, ages: dict[str, str]) -> str:
     return f"cal {ages.get(rec.account, 'never')}" if rec.calibrated else "est"
 
 
+def calibration_notice(account: Account, records: list[Record], calibration: dict) -> list[str]:
+    """Say out loud what the `est` marker only whispers.
+
+    An uncalibrated cap is not a rounding error - it has measured 3-4x too high,
+    which makes the bar read comfortably low exactly when it shouldn't. The
+    command comes with the account already filled in, so the fix is a paste.
+    """
+    capped = [
+        rec for rec in records
+        if rec.account == account.name and rec.source == "local" and rec.limit is not None
+    ]
+    if not capped:  # nothing here has a cap to be wrong about, e.g. Zen only
+        return []
+    if any(not rec.calibrated for rec in capped):
+        return [
+            "caps are assumed, not measured - typically 3-4x too high, so these read low.",
+            "Read the percentages off console.opencode.ai, then:",
+            f"./fumes.py calibrate -a {account.name} --rolling N --weekly N --monthly N",
+        ]
+    days = _calibration_days(calibration)
+    if days is not None and days >= CALIBRATION_STALE_DAYS:
+        return [f"calibration is {days}d old and drifts - recheck it against console.opencode.ai"]
+    return []
+
+
 def _heading(account: Account, color: bool) -> str:
     """The account's name, plus its provider when the name doesn't give it away."""
     if account.name == account.provider:
@@ -803,7 +839,9 @@ def _heading(account: Account, color: bool) -> str:
 
 
 def render_table(accounts: list[Account], records: list[Record],
-                 errors: list[tuple[Account, str]], color: bool, ages: dict[str, str]) -> str:
+                 errors: list[tuple[Account, str]], color: bool,
+                 calibrations: dict[str, dict]) -> str:
+    ages = {name: _calibration_age(block) for name, block in calibrations.items()}
     cells = []
     for rec in records:
         cells.append((
@@ -833,6 +871,10 @@ def render_table(accounts: list[Account], records: list[Record],
             )
         if message := failed.get(account.name):
             lines.append(f"  {RED if color else ''}{message}{RESET if color else ''}")
+        notice = calibration_notice(account, records, calibrations.get(account.name, {}))
+        for index, line in enumerate(notice):
+            tint, off = (YELLOW, RESET) if color else ("", "")
+            lines.append(f"  {tint}{'!' if index == 0 else ' '} {line}{off}")
     return "\n".join(lines) if lines else "nothing to report"
 
 
@@ -840,6 +882,7 @@ def snapshot(accounts: list[Account], records: list[Record],
              errors: list[tuple[Account, str]], calibrations: dict[str, dict]) -> dict:
     return {
         "ts": datetime.now(timezone.utc).isoformat(),
+        "version": VERSION,
         "accounts": [
             {"name": a.name, "provider": a.provider, "folder": str(a.folder)} for a in accounts
         ],
@@ -852,8 +895,11 @@ def snapshot(accounts: list[Account], records: list[Record],
 
 
 def report(args) -> int:
-    accounts = select_accounts(load_accounts(), args.account, args.provider)
-    calibrations = load_calibration(accounts)
+    configured = load_accounts()
+    # Ownership of a legacy calibration is positional, so it has to be resolved
+    # against every configured account: -a must not decide who inherits it.
+    calibrations = load_calibration(configured)
+    accounts = select_accounts(configured, args.account, args.provider)
 
     records: list[Record] = []
     errors: list[tuple[Account, str]] = []
@@ -871,13 +917,13 @@ def report(args) -> int:
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
-        ages = {name: _calibration_age(block) for name, block in calibrations.items()}
-        print(render_table(accounts, records, errors, sys.stdout.isatty(), ages))
+        print(render_table(accounts, records, errors, sys.stdout.isatty(), calibrations))
     return 1 if errors and not records else 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="How much is left across your AI providers.")
+    parser.add_argument("-V", "--version", action="version", version=f"fumes {VERSION}")
     sub = parser.add_subparsers(dest="command")
 
     show = sub.add_parser("report", help="print current usage (default)")
@@ -900,10 +946,12 @@ def main() -> int:
     fit.add_argument("--clear", action="store_true", help="forget it and use assumed caps")
     fit.set_defaults(func=calibrate)
 
-    # No subcommand (or only flags) means `report` - but leave -h alone, so that
-    # bare --help lists the subcommands instead of just report's own options.
+    # No subcommand (or only flags) means `report` - but leave the parser's own
+    # flags alone, so that bare --help lists the subcommands instead of just
+    # report's own options, and --version doesn't become `report --version`.
     argv = sys.argv[1:]
-    if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help")):
+    top_level = ("-h", "--help", "-V", "--version")
+    if not argv or (argv[0].startswith("-") and argv[0] not in top_level):
         argv.insert(0, "report")
     args = parser.parse_args(argv)
     try:

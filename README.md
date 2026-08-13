@@ -21,7 +21,7 @@ caps, `uncapped` for pay-as-you-go.
 
 ## Install
 
-Single file, Python 3.10+, one dependency:
+Single file, Python 3.12+, one dependency:
 
 ```bash
 pip install httpx

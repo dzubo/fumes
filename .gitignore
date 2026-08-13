@@ -10,3 +10,4 @@ settings.json
 
 __pycache__/
 *.pyc
+*.egg-info/

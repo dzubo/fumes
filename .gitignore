@@ -5,5 +5,8 @@ calibration.json
 # Your account list — local paths, and which logins you happen to have
 settings.json
 
+# Virtual environment (created by uv)
+.venv/
+
 __pycache__/
 *.pyc

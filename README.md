@@ -21,11 +21,26 @@ caps, `uncapped` for pay-as-you-go.
 
 ## Install
 
-Single file, Python 3.12+, one dependency:
+Single file, Python 3.12+, one dependency. The repo carries a `pyproject.toml`,
+a `uv.lock` and a `.python-version`, so [uv](https://docs.astral.sh/uv/)
+reproduces the environment exactly:
+
+```bash
+git clone git@github.com:dzubo/fumes.git && cd fumes
+uv run ./fumes.py
+```
+
+`uv run` builds `.venv` from the lockfile on first use and re-checks it on every
+run, so there is no activate step and no `pip install`. It also pins *which*
+environment you get: a virtualenv that happens to be active elsewhere in your
+shell is reported and ignored rather than silently used. The sync check costs
+~20-30ms over calling the venv's Python directly, which is cheap enough for a
+statusline or a cron entry.
+
+Without uv, it is still one file and one dependency:
 
 ```bash
 pip install httpx
-git clone git@github.com:dzubo/fumes.git && cd fumes
 ./fumes.py
 ```
 
@@ -37,6 +52,36 @@ git clone git@github.com:dzubo/fumes.git && cd fumes
 ./fumes.py --no-history     # skip the snapshot append
 ./fumes.py --version        # also stamped into every history.jsonl line
 ```
+
+### A shortcut worth adding
+
+Examples throughout this README are written `./fumes.py`; read them as
+`uv run ./fumes.py` under uv. Having to stand in the repo is a nuisance for
+something you check between other tasks, so give yourself a `fumes` that works
+from anywhere — a function in `~/.bashrc`, pointed at your clone:
+
+```bash
+# fumes - AI provider limits. --project pins the env to the repo's uv.lock, so
+# it works from any directory and ignores whatever venv is active.
+fumes() { uv run --project ~/projects/fumes ~/projects/fumes/fumes.py "$@"; }
+```
+
+`source ~/.bashrc` to pick it up in shells that are already open. Arguments pass
+straight through, so every invocation below works as `fumes --json`,
+`fumes -p claude`, and so on. This keeps `uv.lock` as the single source of truth
+for what gets installed, which the two alternatives give up:
+
+- **PEP 723 inline metadata.** Change the shebang to
+  `#!/usr/bin/env -S uv run --script` and declare `httpx` in a `# /// script`
+  block; then `./fumes.py` runs from any directory, including through a symlink
+  on your `PATH`. The cost is a second place declaring the dependency, since
+  `--script` builds an isolated environment from the inline block and ignores
+  `uv.lock`.
+- **`uv tool install --editable .`** with a `[project.scripts]` entry point puts
+  a real `fumes` on `PATH`. Keep `--editable`: without it uv copies the script
+  into the tool's own venv, and because `history.jsonl` and `calibration.json`
+  are written next to the script, your snapshots and fitted caps would start
+  landing there instead of in the clone.
 
 ## Accounts
 

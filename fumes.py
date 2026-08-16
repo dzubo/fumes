@@ -64,7 +64,7 @@ TIMEOUT = 15.0
 
 # Stamped into every history.jsonl snapshot: the file has already changed shape
 # once, so a reader shouldn't have to sniff which version wrote a given line.
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 CLAUDE_CREDENTIALS_NAME = ".credentials.json"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -117,6 +117,7 @@ class Record:
     resets_at: str | None  # ISO 8601
     source: str  # "live" | "local"
     calibrated: bool = False  # local windows only: is the cap measured or assumed?
+    carried: float = 0.0  # of `used`, how much the local database could not see
     note: str | None = None
 
 
@@ -381,6 +382,30 @@ def _opencode_auth(data_dir: Path) -> dict:
         return {}
 
 
+def _carried(window: str, config: dict, now: datetime) -> float:
+    """Spend inside this window that the local database cannot account for.
+
+    A fresh data dir - a rebuilt box, a moved profile - leaves the console still
+    counting spend that never entered this database, so the local rollup is short
+    by a constant. Usage is affine in that constant, not proportional to it:
+    pct = (local + carried) / cap. Calibrating the cap alone silently assumes
+    carried == 0, which is what makes a fresh dir read 0% against a live console.
+
+    The offset is held in dollars, never percent, so refitting the cap later
+    cannot invalidate it. It expires at the instant the spend it stands for
+    leaves the window - `offset_until` - because past that reset the console has
+    dropped it too, and an offset that outlives its window is phantom spend.
+    A rolling window ages its own spend out continuously and never carries one.
+    """
+    offset = config.get("offset")
+    if not offset or window == "session":
+        return 0.0
+    until = config.get("offset_until")
+    if until and now >= datetime.fromisoformat(until):
+        return 0.0
+    return float(offset)
+
+
 @dataclass
 class Spend:
     """Local spend per provider per window, plus the oldest message in each."""
@@ -456,7 +481,8 @@ def fetch_opencode(account: Account, calibration: dict) -> list[Record]:
         ):
             config = windows.get(window, {})
             cap = config.get("cap", DEFAULT_CAPS[window])
-            used = spend.get("opencode-go", window)
+            carried = _carried(window, config, now)
+            used = spend.get("opencode-go", window) + carried
             resets = bounds[window][1]
             if resets is None:
                 # A rolling window has no reset instant - the oldest spend simply
@@ -476,6 +502,7 @@ def fetch_opencode(account: Account, calibration: dict) -> list[Record]:
                     resets_at=resets.isoformat() if resets else None,
                     source="local",
                     calibrated="cap" in config,
+                    carried=round(carried, 4),
                     note=f"calibrated {age}" if "cap" in config else "assumed cap, never calibrated",
                 )
             )
@@ -707,6 +734,13 @@ def calibrate(args) -> int:
     bounds = window_bounds(now, calibration)
     spend = read_spend(_opencode_dbs(account.folder), bounds)
 
+    # One console reading cannot pin down both the cap and the carried offset, so
+    # each mode holds one fixed and solves for the other. Default: carried == 0,
+    # solve the cap. With --offset: the cap stands and the missing history is what
+    # gets measured, which is what a fresh data dir actually needs.
+    if args.offset:
+        return fit_offsets(account, calibration, calibrations, observed, bounds, spend, now, moved)
+
     rows, skipped, coarse = [], [], []
     for window, percent in observed.items():
         used = spend.get("opencode-go", window)
@@ -762,6 +796,67 @@ def calibrate(args) -> int:
     return 0
 
 
+def fit_offsets(account: Account, calibration: dict, calibrations: dict, observed: dict,
+                bounds: dict, spend: Spend, now: datetime, moved: list[str]) -> int:
+    """Hold each cap and solve for the spend the local database cannot see.
+
+    Inverts the cap fit: `cap * pct == local + carried`, with cap known, so
+    carried is whatever the console is counting that this database is not.
+    """
+    windows = calibration.setdefault("windows", {})
+    rows, skipped = [], []
+    for window, percent in observed.items():
+        config = windows.setdefault(window, {})
+        if window == "session":
+            skipped.append("session: rolling window ages its own spend out - carries no offset")
+            continue
+        if "cap" not in config:
+            skipped.append(f"{window}: no measured cap to hold - fit the cap first, without --offset")
+            continue
+        cap, local = config["cap"], spend.get("opencode-go", window)
+        offset = cap * percent / 100 - local
+        if percent <= 0 or offset <= 0:
+            # Either the console agrees there is nothing in the window, or local
+            # spend already accounts for all of it. Both mean: carry nothing.
+            reason = ("console reads 0%" if percent <= 0
+                      else f"local ${local:.2f} already covers {percent:.0f}% of ${cap:.2f}")
+            had = config.pop("offset", None) is not None
+            config.pop("offset_until", None)
+            config.pop("offset_pct", None)
+            config.pop("offset_at", None)
+            skipped.append(f"{window}: {reason} - {'offset cleared' if had else 'nothing carried'}")
+            continue
+        reset = bounds[window][1]
+        config.update({
+            "offset": round(offset, 4),
+            "offset_until": reset.isoformat(),
+            "offset_pct": percent,
+            "offset_at": now.isoformat(),
+        })
+        rows.append((window, local, percent, offset, cap, reset))
+
+    # Deliberately not touching `calibrated_at`: no cap was refitted here, and
+    # advancing it would report stale caps as fresh and mute the drift warning.
+    calibrations[account.name] = calibration
+    save_calibration(calibrations)
+
+    print(f"fitted carried spend for {account.name} against the OpenCode console "
+          f"at {now.astimezone():%Y-%m-%d %H:%M}\n")
+    if rows:
+        print(f"  {'window':<8} {'local':>8} {'console':>8} {'carried':>9} {'held cap':>9}  expires")
+        for window, local, percent, offset, cap, reset in rows:
+            print(f"  {window:<8} {'$%.2f' % local:>8} {'%.0f%%' % percent:>8} "
+                  f"{'$%.2f' % offset:>9} {'$%.2f' % cap:>9}  {reset:%a %d %b %H:%M} UTC")
+    for line in moved:
+        print(f"\n  {line}")
+    for line in skipped:
+        print(f"\n  skipped {line}")
+    print(f"\n  written to {CALIBRATION_FILE}")
+    if rows:
+        print("  carried spend expires with its window - this is not a permanent correction")
+    return 0
+
+
 # --------------------------------------------------------------------------- #
 # rendering
 # --------------------------------------------------------------------------- #
@@ -802,7 +897,10 @@ def _basis(rec: Record, ages: dict[str, str]) -> str:
         return ""
     if rec.limit is None:
         return "uncapped"
-    return f"cal {ages.get(rec.account, 'never')}" if rec.calibrated else "est"
+    basis = f"cal {ages.get(rec.account, 'never')}" if rec.calibrated else "est"
+    # Never let carried spend hide inside the total: the bar matches the console,
+    # but only part of it is backed by rows in the local database.
+    return f"{basis}, incl ${rec.carried:.2f} carried" if rec.carried else basis
 
 
 def calibration_notice(account: Account, records: list[Record], calibration: dict) -> list[str]:
@@ -942,6 +1040,9 @@ def main() -> int:
     fit.add_argument("--monthly", type=float, help="monthly %% shown on the console")
     fit.add_argument("--weekly-resets", metavar="DUR", help="its weekly countdown, e.g. '5d 21h'")
     fit.add_argument("--monthly-resets", metavar="DUR", help="its monthly countdown, e.g. '30d 23h'")
+    fit.add_argument("--offset", action="store_true",
+                     help="hold the measured caps and fit the spend the local db cannot see "
+                          "(for a fresh data dir, where the console counts history it never had)")
     fit.add_argument("--show", action="store_true", help="print the stored calibration")
     fit.add_argument("--clear", action="store_true", help="forget it and use assumed caps")
     fit.set_defaults(func=calibrate)

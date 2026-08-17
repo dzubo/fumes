@@ -118,9 +118,9 @@ are checked when the settings file loads and anything outside
 `[A-Za-z0-9][A-Za-z0-9_-]*` is rejected with the offending entry named:
 
 ```
-settings.json accounts[1]: account name 'work.claude' is not valid - start with
-a letter or digit and use only letters, digits, '-' and '_' (the name is used
-as a key by this tool and others)
+error: /home/you/.config/fumes/settings.json accounts[1]: account name
+'work.claude' is not valid - start with a letter or digit and use only letters,
+digits, '-' and '_' (the name is used as a key by this tool and others)
 ```
 
 Accounts are read from `$FUMES_SETTINGS`, else `settings.json` beside the

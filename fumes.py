@@ -312,7 +312,7 @@ def parse_duration(text: str) -> timedelta:
 
 
 def window_bounds(now: datetime, calibration: dict) -> dict[str, tuple[datetime, datetime | None]]:
-    """(start, reset) per window. A rolling window has no reset instant - see below."""
+    """(start, reset) per window. The session bound is only a read floor - see session_block."""
     windows = calibration.get("windows", {})
     hours = windows.get("session", {}).get("hours", GO_SESSION_HOURS)
     return {
@@ -401,7 +401,8 @@ def _carried(window: str, config: dict, now: datetime) -> float:
     cannot invalidate it. It expires at the instant the spend it stands for
     leaves the window - `offset_until` - because past that reset the console has
     dropped it too, and an offset that outlives its window is phantom spend.
-    A rolling window ages its own spend out continuously and never carries one.
+    A session block never carries one: it opens empty on the next message, so
+    there is no boundary in the past for missing spend to sit behind.
     """
     offset = config.get("offset")
     if not offset or window == "session":
@@ -414,18 +415,47 @@ def _carried(window: str, config: dict, now: datetime) -> float:
 
 @dataclass
 class Spend:
-    """Local spend per provider per window, plus the oldest message in each."""
+    """Local spend per provider per window, plus when the session window resets."""
 
     totals: dict[str, dict[str, float]] = field(default_factory=dict)
-    oldest: dict[str, float] = field(default_factory=dict)
+    session_reset: datetime | None = None  # None: no session block is open
 
     def get(self, provider: str, window: str) -> float:
         return self.totals.get(provider, {}).get(window, 0.0)
 
 
-def read_spend(dbs: list[Path], bounds: dict[str, tuple[datetime, datetime | None]]) -> Spend:
+def session_block(events: list[tuple[float, float]], span: float, now: datetime
+                  ) -> tuple[float, datetime | None]:
+    """Spend in the open session block, and the instant it expires.
+
+    The console's "rolling usage" does not slide: a block opens on the first
+    message sent while none is open, runs for a fixed `span`, and then drops
+    *whole*, taking spend only minutes old with it. Summing the last `span`
+    hours instead - as if the window slid - keeps counting an expired block's
+    tail, so the table reads high (and claims a reset) exactly when the console
+    has already gone back to 0%.
+
+    Blocks are therefore replayed forward: each message either falls inside the
+    open block or opens the next one. Only a message younger than `span` can
+    leave a block open, so a chain that starts mid-history still converges - and
+    every gap longer than `span` re-anchors it exactly.
+    """
+    anchor, used = None, 0.0
+    for created, cost in events:
+        if anchor is None or created >= anchor + span:
+            anchor, used = created, 0.0
+        used += cost
+    if anchor is None or now.timestamp() >= anchor + span:
+        return 0.0, None  # nothing open: the next message starts a fresh block
+    return used, datetime.fromtimestamp(anchor + span, timezone.utc)
+
+
+def read_spend(dbs: list[Path], bounds: dict[str, tuple[datetime, datetime | None]],
+               now: datetime) -> Spend:
     spend = Spend(totals={"opencode-go": {}, "opencode": {}})
-    floor_ms = int(min(start for start, _ in bounds.values()).timestamp() * 1000)
+    start_of = {window: start.timestamp() for window, (start, _) in bounds.items()}
+    floor_ms = int(min(start_of.values()) * 1000)
+    events: list[tuple[float, float]] = []
     for db in dbs:
         for created_ms, blob in _read_messages(db, floor_ms):
             try:
@@ -439,12 +469,19 @@ def read_spend(dbs: list[Path], bounds: dict[str, tuple[datetime, datetime | Non
             if not cost:
                 continue
             created = created_ms / 1000
-            for window, (start, _) in bounds.items():
-                if created >= start.timestamp():
+            if provider == "opencode-go":
+                events.append((created, cost))
+            for window, start in start_of.items():
+                # session is a block, not a sum over the last N hours - see below.
+                if window != "session" and created >= start:
                     totals = spend.totals[provider]
                     totals[window] = totals.get(window, 0.0) + cost
-                    key = f"{provider}:{window}"
-                    spend.oldest[key] = min(spend.oldest.get(key, created), created)
+
+    # Blocks have to be replayed in order, and the databases are read one by one.
+    events.sort()
+    span = now.timestamp() - start_of["session"]
+    used, spend.session_reset = session_block(events, span, now)
+    spend.totals["opencode-go"]["session"] = used
     return spend
 
 
@@ -475,7 +512,7 @@ def fetch_opencode(account: Account, calibration: dict) -> list[Record]:
 
     now = datetime.now(timezone.utc)
     bounds = window_bounds(now, calibration)
-    spend = read_spend(dbs, bounds)
+    spend = read_spend(dbs, bounds, now)
 
     records = []
     if "opencode-go" in auth:
@@ -489,12 +526,9 @@ def fetch_opencode(account: Account, calibration: dict) -> list[Record]:
             cap = config.get("cap", DEFAULT_CAPS[window])
             carried = _carried(window, config, now)
             used = spend.get("opencode-go", window) + carried
-            resets = bounds[window][1]
-            if resets is None:
-                # A rolling window has no reset instant - the oldest spend simply
-                # ages out. Report that moment; it's when budget first frees up.
-                first = spend.oldest.get("opencode-go:session")
-                resets = datetime.fromtimestamp(first + hours * 3600, timezone.utc) if first else None
+            # A closed session block resets on the next message, not at a knowable
+            # instant, so it reports no countdown at all rather than a made-up one.
+            resets = spend.session_reset if window == "session" else bounds[window][1]
             records.append(
                 Record(
                     account=account.name,
@@ -746,7 +780,7 @@ def calibrate(args) -> int:
         moved.append(f"monthly window now anchored on day {reset.day} at {reset:%H:%M} UTC")
 
     bounds = window_bounds(now, calibration)
-    spend = read_spend(_opencode_dbs(account.folder), bounds)
+    spend = read_spend(_opencode_dbs(account.folder), bounds, now)
 
     # One console reading cannot pin down both the cap and the carried offset, so
     # each mode holds one fixed and solves for the other. Default: carried == 0,
@@ -822,7 +856,7 @@ def fit_offsets(account: Account, calibration: dict, calibrations: dict, observe
     for window, percent in observed.items():
         config = windows.setdefault(window, {})
         if window == "session":
-            skipped.append("session: rolling window ages its own spend out - carries no offset")
+            skipped.append("session: a block opens empty and expires whole - carries no offset")
             continue
         if "cap" not in config:
             skipped.append(f"{window}: no measured cap to hold - fit the cap first, without --offset")

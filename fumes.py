@@ -85,6 +85,12 @@ CALIBRATION_STALE_DAYS = 14
 
 WINDOW_FLAGS = {"session": "rolling", "week": "weekly", "month": "monthly"}
 
+# An account name is an identifier, not a label: it keys calibration.json, and
+# downstream consumers put it in dotted key paths and in regexes matching them.
+# A dot would split such a path, a space or a metacharacter would break the
+# match - so allow only what is safe in all of those places.
+ACCOUNT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
+
 
 class ProviderError(Exception):
     """An account could not be read. Never fatal - the other accounts still print."""
@@ -620,8 +626,16 @@ def _read_account(entry: object, where: str) -> Account:
         raise ConfigError(f"{where} has provider {provider!r} - known providers are {known}")
     folder_default, binary_default = PROVIDER_DEFAULTS[provider]
     folder = entry.get("folder")
+    name = str(entry.get("name") or provider)
+    # fullmatch, not match: `$` would let a trailing newline through.
+    if not ACCOUNT_NAME.fullmatch(name):
+        raise ConfigError(
+            f"{where}: account name {name!r} is not valid - start with a letter or "
+            "digit and use only letters, digits, '-' and '_' (the name is used as a "
+            "key by this tool and others)"
+        )
     return Account(
-        name=str(entry.get("name") or provider),
+        name=name,
         provider=provider,
         folder=_expand(folder) if folder else folder_default(),
         binary=str(entry.get("binary") or binary_default),

@@ -101,7 +101,7 @@ Code login, two OpenCode data dirs. Copy `settings.example.json` to
 
 | Field | Meaning |
 |---|---|
-| `name` | What the table calls it and what `-a` selects. Must be unique — it also keys the calibration. |
+| `name` | What the table calls it and what `-a` selects. Must be unique, and must match `[A-Za-z0-9][A-Za-z0-9_-]*` — see below. |
 | `provider` | `claude` or `opencode`. The adapter that knows how to read the folder. |
 | `folder` | Where that provider keeps its state — Claude Code's config dir (holding `.credentials.json`), OpenCode's data dir (holding `auth.json` and `opencode*.db`). `~` and `$VARS` expand. |
 | `binary` | The CLI that owns the folder. **Never executed** — it appears in hints, e.g. which command to run to refresh an expired token. |
@@ -109,6 +109,19 @@ Code login, two OpenCode data dirs. Copy `settings.example.json` to
 Only `provider` is required; the rest fall back to that provider's defaults.
 Everything an account needs to be told apart lives in its folder, so a second
 login is a settings entry, not a code change.
+
+The name is an identifier, not a label. It keys `calibration.json`, and tools
+that read this one's output put it into dotted key paths
+(`data.by_account.claude.records.0.pct`) and into the regexes that match them —
+so a dot would split the path and a space or a `(` would break the match. Names
+are checked when the settings file loads and anything outside
+`[A-Za-z0-9][A-Za-z0-9_-]*` is rejected with the offending entry named:
+
+```
+settings.json accounts[1]: account name 'work.claude' is not valid - start with
+a letter or digit and use only letters, digits, '-' and '_' (the name is used
+as a key by this tool and others)
+```
 
 Accounts are read from `$FUMES_SETTINGS`, else `settings.json` beside the
 script, else `~/.config/fumes/settings.json`. **With no settings file at all,

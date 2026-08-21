@@ -162,7 +162,9 @@ def fetch_claude(account: Account, _calibration: dict) -> list[Record]:
     # Deliberately read-only: Claude Code owns this file and refreshes the token
     # itself. Refreshing here would race it, so an expired token is just reported.
     expires_at = creds.get("expiresAt")
-    if expires_at and expires_at / 1000 <= datetime.now(timezone.utc).timestamp():
+    if not creds.get("accessToken") or not expires_at:
+        raise ProviderError(f"no valid token - run `{_refresh_hint(account)}` to log in")
+    if expires_at / 1000 <= datetime.now(timezone.utc).timestamp():
         when = datetime.fromtimestamp(expires_at / 1000).strftime("%H:%M")
         raise ProviderError(
             f"OAuth token expired at {when} - run `{_refresh_hint(account)}` to refresh"

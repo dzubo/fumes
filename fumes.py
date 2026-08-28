@@ -64,7 +64,7 @@ TIMEOUT = 15.0
 
 # Stamped into every history.jsonl snapshot: the file has already changed shape
 # once, so a reader shouldn't have to sniff which version wrote a given line.
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 CLAUDE_CREDENTIALS_NAME = ".credentials.json"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -108,6 +108,7 @@ class Account:
     provider: str
     folder: Path
     binary: str  # only ever named in hints, never executed
+    exclude: tuple[str, ...] = ()  # record labels this account should not report
 
 
 @dataclass
@@ -670,11 +671,15 @@ def _read_account(entry: object, where: str) -> Account:
             "digit and use only letters, digits, '-' and '_' (the name is used as a "
             "key by this tool and others)"
         )
+    exclude = entry.get("exclude", [])
+    if not isinstance(exclude, list) or not all(isinstance(x, str) for x in exclude):
+        raise ConfigError(f"{where}: 'exclude' must be a list of record labels")
     return Account(
         name=name,
         provider=provider,
         folder=_expand(folder) if folder else folder_default(),
         binary=str(entry.get("binary") or binary_default),
+        exclude=tuple(exclude),
     )
 
 
@@ -1053,7 +1058,10 @@ def report(args) -> int:
     errors: list[tuple[Account, str]] = []
     for account in accounts:
         try:
-            records.extend(PROVIDERS[account.provider](account, calibrations.get(account.name, {})))
+            fetched = PROVIDERS[account.provider](account, calibrations.get(account.name, {}))
+            # An account's exclude list drops records by label, so a login can
+            # carry a subscription whose numbers this output should not report.
+            records.extend(r for r in fetched if r.label not in account.exclude)
         except ProviderError as exc:
             errors.append((account, str(exc)))
 

@@ -17,7 +17,8 @@
       "name": "opencode",
       "provider": "opencode",
       "folder": "~/.local/share/opencode",
-      "binary": "opencode"
+      "binary": "opencode",
+      "exclude": ["zen month"]
     }
   ]
 }

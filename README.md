@@ -198,10 +198,15 @@ each console shows its own percentages, so each gets its own caps and window
 anchors. `-a` is optional while only one OpenCode account is configured, and
 required once there are several. `--show` without `-a` prints them all.
 
-Each percentage is divided into the local spend for that window to get the
-**effective cap** — the local-dollar figure that reproduces the console's number.
-The optional countdowns move the window boundaries, and are applied *first*: a cap
-fitted over the wrong window is meaningless. Results land in `calibration.json`.
+Each percentage is divided into the spend the console is counting for that
+window — local, plus anything `--offset` has recorded as carried — to get the
+**effective cap**, the local-dollar figure that reproduces the console's number.
+Where a carried figure exists it was itself fitted against the cap now being
+replaced, so if it came with its own console reading the two readings are solved
+together and both move: `cap = Δlocal / Δpct`, owing nothing to the discarded
+cap. The optional countdowns move the window boundaries, and are applied
+*first*: a cap fitted over the wrong window is meaningless. Results land in
+`calibration.json`.
 
 Until you do, the table says so under the account's rows — an uncalibrated cap
 isn't a rounding error, it has measured 3–4× too high, which makes the bar read

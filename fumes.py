@@ -64,7 +64,7 @@ TIMEOUT = 15.0
 
 # Stamped into every history.jsonl snapshot: the file has already changed shape
 # once, so a reader shouldn't have to sniff which version wrote a given line.
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 CLAUDE_CREDENTIALS_NAME = ".credentials.json"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -81,6 +81,12 @@ DEFAULT_CAPS = {"session": 12.0, "week": 30.0, "month": 60.0}
 # Dividing a percentage into near-zero spend produces a garbage cap, so a window
 # needs at least this much local spend before it can be calibrated.
 MIN_CALIBRATION_SPEND = 0.25
+
+# Two console readings pin down cap and carried spend together, but the console
+# rounds to whole percent, so the pair is only worth solving when they are far
+# enough apart: the cap carries roughly 1/gap of relative error, i.e. 20% at a
+# 5-point gap. Closer than that, hold the carried dollars and move the cap alone.
+MIN_READING_GAP = 5.0
 CALIBRATION_STALE_DAYS = 14
 
 WINDOW_FLAGS = {"session": "rolling", "week": "weekly", "month": "monthly"}
@@ -733,6 +739,45 @@ def calibration_account(accounts: list[Account], name: str | None) -> Account:
 # --------------------------------------------------------------------------- #
 
 
+def fit_cap(percent: float, local: float, carried: float,
+            config: dict) -> tuple[float, float, float, str]:
+    """Solve for the cap a console reading implies over the spend it covers.
+
+    The console counts local + carried, never local alone, so a cap divided out
+    of local while the bar keeps adding the offset makes the table contradict
+    the reading it was just handed - hand it 100% and it prints 151%.
+
+    Carried dollars are not independent of the cap either: `--offset` solved
+    them against the cap this reading is about to discard. When that fit
+    recorded its own console percentage, the two readings are two equations in
+    two unknowns
+
+        pct_then * cap = local_then + carried
+        pct_now  * cap = local_now  + carried
+
+    and subtracting drops the carried term: cap = d_local / d_pct, owing
+    nothing to the cap being replaced. Carried follows from either row. Without
+    a usable earlier reading the carried dollars stand and only the cap moves.
+
+    Returns the cap, the carried spend that belongs with it, the local spend at
+    the earlier reading (for the caller to store), and which solve ran.
+    """
+    if not carried:
+        return local / (percent / 100), 0.0, 0.0, "plain"
+
+    prior, then = config.get("offset_pct"), config.get("offset_local")
+    if then is None and prior and "cap" in config:
+        # Calibrations written before offset_local carry it implicitly:
+        # fit_offsets solved offset = cap * pct - local, so this inverts exactly.
+        then = config["cap"] * prior / 100 - carried
+    if (then is None or not prior or percent - prior < MIN_READING_GAP
+            or local - then < MIN_CALIBRATION_SPEND):
+        return (local + carried) / (percent / 100), carried, 0.0, "held"
+
+    cap = (local - then) / ((percent - prior) / 100)
+    return cap, prior / 100 * cap - then, then, "paired"
+
+
 def calibrate(args) -> int:
     accounts = load_accounts()
     calibrations = load_calibration(accounts)
@@ -798,9 +843,11 @@ def calibrate(args) -> int:
 
     rows, skipped, coarse = [], [], []
     for window, percent in observed.items():
-        used = spend.get("opencode-go", window)
+        local = spend.get("opencode-go", window)
         config = windows.setdefault(window, {})
         was = config.get("cap", DEFAULT_CAPS[window])
+        carried = _carried(window, config, now)
+        used = local + carried
         if percent <= 0:
             skipped.append(f"{window}: console reads 0% - nothing to divide into")
             continue
@@ -810,15 +857,27 @@ def calibrate(args) -> int:
                 f"(need ${MIN_CALIBRATION_SPEND:.2f}) - cap left at ${was:.2f}"
             )
             continue
-        cap = used / (percent / 100)
+        cap, carried, then, mode = fit_cap(percent, local, carried, config)
         config.update({
             "cap": round(cap, 4),
             "observed_pct": percent,
-            "local_spend": round(used, 4),
+            "local_spend": round(local, 4),
             "at": now.isoformat(),
         })
-        rows.append((window, used, percent, cap, was))
-        if percent < 10:
+        rows.append((window, local, carried, percent, cap, was))
+        if mode == "paired":
+            # Both were re-solved together, so the stored offset has to move with
+            # the cap - leaving the old dollars would reinstate the discarded cap.
+            config["offset"] = round(carried, 4)
+            config["offset_local"] = round(then, 4)
+            prior, gap = config["offset_pct"], percent - config["offset_pct"]
+            coarse.append(
+                f"{window}: solved against the {prior:.0f}% reading of "
+                f"{datetime.fromisoformat(config['offset_at']):%d %b} as well - "
+                f"{gap:.0f} points apart, so console rounding puts the cap within "
+                f"{100 / gap:.0f}%. ${carried:.2f} carried was refitted with it."
+            )
+        elif percent < 10:
             # The console rounds to whole percent, so a small reading carries a
             # large relative error: 6% is really 5.5-6.5%, i.e. +/-8% on the cap.
             span = (used / (percent / 100 + 0.005), used / (percent / 100 - 0.005))
@@ -835,9 +894,16 @@ def calibrate(args) -> int:
     print(f"calibrated {account.name} against the OpenCode console "
           f"at {now.astimezone():%Y-%m-%d %H:%M}\n")
     if rows:
-        print(f"  {'window':<8} {'local':>8} {'console':>8} {'effective cap':>14} {'was':>9}")
-        for window, used, percent, cap, was in rows:
-            print(f"  {window:<8} {'$%.2f' % used:>8} {'%.0f%%' % percent:>8} "
+        # The carried column earns its width only when something is carried;
+        # without it the fit is local against the console and a column of
+        # zeroes would just be noise.
+        carries = any(carried for _, _, carried, _, _, _ in rows)
+        held = f" {'carried':>9}" if carries else ""
+        print(f"  {'window':<8} {'local':>8}{held} {'console':>8} "
+              f"{'effective cap':>14} {'was':>9}")
+        for window, local, carried, percent, cap, was in rows:
+            amount = f" {'$%.2f' % carried:>9}" if carries else ""
+            print(f"  {window:<8} {'$%.2f' % local:>8}{amount} {'%.0f%%' % percent:>8} "
                   f"{'$%.2f' % cap:>14} {'$%.2f' % was:>9}")
     for line in moved:
         print(f"\n  {line}")
@@ -878,6 +944,7 @@ def fit_offsets(account: Account, calibration: dict, calibrations: dict, observe
             had = config.pop("offset", None) is not None
             config.pop("offset_until", None)
             config.pop("offset_pct", None)
+            config.pop("offset_local", None)
             config.pop("offset_at", None)
             skipped.append(f"{window}: {reason} - {'offset cleared' if had else 'nothing carried'}")
             continue
@@ -886,6 +953,7 @@ def fit_offsets(account: Account, calibration: dict, calibrations: dict, observe
             "offset": round(offset, 4),
             "offset_until": reset.isoformat(),
             "offset_pct": percent,
+            "offset_local": round(local, 4),
             "offset_at": now.isoformat(),
         })
         rows.append((window, local, percent, offset, cap, reset))

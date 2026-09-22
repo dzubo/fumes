@@ -5,10 +5,11 @@ fumes - how much is left before you are running on fumes? One view of AI provide
 Providers:
     claude    live  - Claude Code's OAuth token against api.anthropic.com/api/oauth/usage.
                       Authoritative: these are the server's own numbers.
-    opencode  local - rolled up from opencode's own SQLite accounting
-                      (~/.local/share/opencode/opencode*.db). OpenCode exposes no
-                      usage API, so windows and caps are applied client-side and
-                      are only as good as the last calibration (see below).
+    opencode  live  - the Go plan's percentages from opencode's usage endpoint
+                      (zen/go/v1/usage), authenticated with the API key opencode
+                      already keeps in auth.json; Zen pay-as-you-go spend rolled
+                      up from the console's usage export CSV, which needs a
+                      service account key (see below).
 
 Accounts:
     Each provider can be configured any number of times - a work and a personal
@@ -26,30 +27,25 @@ Usage:
     ./fumes.py --no-history     # don't append a snapshot
     ./fumes.py --version        # also stamped into every history.jsonl line
 
-    # teach it the real OpenCode Go numbers, read off console.opencode.ai
-    ./fumes.py calibrate -a opencode --rolling 42 --weekly 87 --monthly 6 \
-        --weekly-resets "5d 21h" --monthly-resets "30d 23h"
-    ./fumes.py calibrate --show          # every account
-    ./fumes.py calibrate -a opencode --clear
+    # Zen spend needs a service account key - create one at console.opencode.ai,
+    # then put it on the account:
+    #   {"name": "opencode", "provider": "opencode", "service_key": "oc_sk_..."}
 
 Every report run appends a snapshot to history.jsonl beside this file (gitignored)
-so burn-rate and trends are recoverable later. Calibration is stored per account
-in calibration.json, because two accounts on the same plan still have their own
-caps.
+so burn-rate and trends are recoverable later.
 
 Dependencies:
     pip install httpx
 """
 
 import argparse
+import csv
 import json
-import math
 import os
 import re
-import sqlite3
 import sys
 from calendar import monthrange
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -57,49 +53,62 @@ import httpx
 
 HERE = Path(__file__).resolve().parent
 HISTORY_FILE = HERE / "history.jsonl"
-CALIBRATION_FILE = HERE / "calibration.json"
 SETTINGS_NAME = "settings.json"
 SETTINGS_ENV = "FUMES_SETTINGS"
 TIMEOUT = 15.0
 
 # Stamped into every history.jsonl snapshot: the file has already changed shape
-# once, so a reader shouldn't have to sniff which version wrote a given line.
-VERSION = "0.5.0"
+# twice, so a reader shouldn't have to sniff which version wrote a given line.
+VERSION = "0.6.0"
 
 CLAUDE_CREDENTIALS_NAME = ".credentials.json"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_BETA = "oauth-2025-04-20"
 
-# OpenCode Go fallbacks, used until `calibrate` replaces them. Unofficial:
-# OpenCode publishes no usage API and no documented limits, so these are the
-# community-observed figures (openusage's docs/providers/opencode.md) applied to
-# opencode's own local cost accounting. Expect them to be wrong - the console's
-# percentages are the only ground truth, hence `calibrate`.
+# The Go plan's percentages, straight from opencode's own metering. The key is
+# the one opencode maintains in auth.json - deliberately read-only, like Claude
+# Code's credentials. Undocumented endpoint: works today, can change.
+ZEN_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+
+# Zen spend comes from the console's usage export (documented:
+# opencode.ai/console/guides/usage). Service account keys only; ranges start at
+# midnight UTC, and 30d is the widest - which still covers the whole current
+# calendar month, so the Zen row never needs a longer window.
+DEFAULT_CONSOLE_URL = "https://opencode.ai/console"
+USAGE_EXPORT_PATH = "/api/v1/usage/export"
+EXPORT_RANGE = "30d"
+
 GO_SESSION_HOURS = 5
-DEFAULT_CAPS = {"session": 12.0, "week": 30.0, "month": 60.0}
 
-# Dividing a percentage into near-zero spend produces a garbage cap, so a window
-# needs at least this much local spend before it can be calibrated.
-MIN_CALIBRATION_SPEND = 0.25
+# The CSV tags each record with how it was funded. Go-plan rows say `go` (and
+# carry zero charge - the plan meters its own dollar-equivalents the CSV never
+# sees); pay-as-you-go rows say `credit`. Web Search charges ride along on
+# org-wide exports under their own service label.
+GO_BILLING_SOURCE = "go"
+CREDIT_BILLING_SOURCE = "credit"
+WEB_SEARCH_SERVICE = "web-search"
 
-# Two console readings pin down cap and carried spend together, but the console
-# rounds to whole percent, so the pair is only worth solving when they are far
-# enough apart: the cap carries roughly 1/gap of relative error, i.e. 20% at a
-# 5-point gap. Closer than that, hold the carried dollars and move the cap alone.
-MIN_READING_GAP = 5.0
-CALIBRATION_STALE_DAYS = 14
+# 100,000,000 micro-cents is one dollar - the export's own convention.
+MICRO_CENTS_PER_DOLLAR = 100_000_000
 
-WINDOW_FLAGS = {"session": "rolling", "week": "weekly", "month": "monthly"}
-
-# An account name is an identifier, not a label: it keys calibration.json, and
-# downstream consumers put it in dotted key paths and in regexes matching them.
-# A dot would split such a path, a space or a metacharacter would break the
-# match - so allow only what is safe in all of those places.
+# An account name is an identifier, not a label: downstream consumers put it in
+# dotted key paths and in regexes matching them. A dot would split such a path,
+# a space or a metacharacter would break the match - so allow only what is safe
+# in all of those places.
 ACCOUNT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 
 class ProviderError(Exception):
-    """An account could not be read. Never fatal - the other accounts still print."""
+    """An account could not be read. Never fatal - the other accounts still print.
+
+    `records` carries what was fetched before the failure: one account can read
+    from two endpoints, and a broken one shouldn't take the working one's rows
+    with it.
+    """
+
+    def __init__(self, message: str, records: list["Record"] | None = None):
+        super().__init__(message)
+        self.records = records or []
 
 
 class ConfigError(Exception):
@@ -115,6 +124,8 @@ class Account:
     folder: Path
     binary: str  # only ever named in hints, never executed
     exclude: tuple[str, ...] = ()  # record labels this account should not report
+    service_key: str = ""  # opencode only: console service account key (Zen spend)
+    console_url: str = ""  # opencode only: where the usage export lives
 
 
 @dataclass
@@ -128,9 +139,7 @@ class Record:
     unit: str  # "percent" | "usd"
     pct: float | None
     resets_at: str | None  # ISO 8601
-    source: str  # "live" | "local"
-    calibrated: bool = False  # local windows only: is the cap measured or assumed?
-    carried: float = 0.0  # of `used`, how much the local database could not see
+    source: str  # "live" - every record now comes from a server
     note: str | None = None
 
 
@@ -153,10 +162,10 @@ def _refresh_hint(account: Account) -> str:
     return f"CLAUDE_CONFIG_DIR={account.folder} {account.binary}"
 
 
-def fetch_claude(account: Account, _calibration: dict) -> list[Record]:
+def fetch_claude(account: Account) -> list[Record]:
     """Read the OAuth token Claude Code already maintains, then ask the server.
 
-    Nothing to calibrate here - the server hands over its own percentages.
+    The server hands over its own percentages; nothing is computed client-side.
     """
     credentials = account.folder / CLAUDE_CREDENTIALS_NAME
     try:
@@ -245,136 +254,12 @@ def _minor(money: dict) -> float:
 
 
 # --------------------------------------------------------------------------- #
-# opencode - calibration
-# --------------------------------------------------------------------------- #
-#
-# OpenCode meters the Go plan server-side and shows only percentages, on a page
-# no API backs. Locally all we have is opencode's own per-message `cost`. Those
-# two disagree - by roughly 4x when first measured - because the plan is not
-# metered at the local cost rates, and because usage from other machines never
-# reaches this database at all.
-#
-# So: read the console's percentages, divide the local spend by each, and keep
-# the resulting *effective cap* - the local-dollar figure that reproduces the
-# console's percentage. Same trick for the window boundaries, which the console
-# gives away through its countdowns (the monthly window turned out to be
-# billing-anchored, not calendar).
-#
-# This is a fit to one observation, not a discovered constant. It drifts.
-# Recalibrate when the console and the table disagree; every record says how old
-# its calibration is.
-#
-# The fit is per account: two OpenCode logins are metered separately, and each
-# one's console shows its own percentages. So calibration.json is keyed by
-# account name.
-
-CALIBRATION_VERSION = 2
-
-
-def load_calibration(accounts: list[Account] | None = None) -> dict[str, dict]:
-    """{account name: calibration block}, migrating the old single-account file."""
-    try:
-        data = json.loads(CALIBRATION_FILE.read_text())
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if isinstance(data.get("accounts"), dict):
-        return data["accounts"]
-    if "windows" in data:
-        # Written before accounts existed, so it describes whichever OpenCode
-        # account came first - back then there could only be the one.
-        owner = next((a.name for a in accounts or [] if a.provider == "opencode"), "opencode")
-        return {owner: data}
-    return {}
-
-
-def save_calibration(calibrations: dict[str, dict]) -> None:
-    if not calibrations:
-        CALIBRATION_FILE.unlink(missing_ok=True)
-        return
-    payload = {"version": CALIBRATION_VERSION, "accounts": calibrations}
-    CALIBRATION_FILE.write_text(json.dumps(payload, indent=2) + "\n")
-
-
-# The unit must not run into another letter ('30d23h' is two tokens, '30 dogs' is
-# none), but it may run straight into the next digit.
-_DURATION_TOKEN = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m)(?![a-z])", re.I
-)
-
-
-def parse_duration(text: str) -> timedelta:
-    """'5d 21h' / '5 days 21 hours' / '4 hours 37 minutes' -> timedelta."""
-    matches = _DURATION_TOKEN.findall(text)
-    if not matches:
-        raise ValueError(f"cannot read a duration from {text!r} - try '5d 21h'")
-    total = timedelta()
-    for amount, unit in matches:
-        unit = unit.lower()
-        value = float(amount)
-        if unit.startswith("d"):
-            total += timedelta(days=value)
-        elif unit.startswith(("h", "hr")):
-            total += timedelta(hours=value)
-        else:
-            total += timedelta(minutes=value)
-    return total
-
-
-def window_bounds(now: datetime, calibration: dict) -> dict[str, tuple[datetime, datetime | None]]:
-    """(start, reset) per window. The session bound is only a read floor - see session_block."""
-    windows = calibration.get("windows", {})
-    hours = windows.get("session", {}).get("hours", GO_SESSION_HOURS)
-    return {
-        "session": (now - timedelta(hours=hours), None),
-        "week": _weekly_bounds(now, windows.get("week", {}).get("reset_at")),
-        "month": _monthly_bounds(now, windows.get("month", {})),
-        # Zen is billed separately from the Go plan, so calibrating the Go
-        # monthly anchor must not drag Zen's month off the calendar.
-        "calendar_month": _monthly_bounds(now, {}),
-    }
-
-
-def _weekly_bounds(now: datetime, reset_at: str | None) -> tuple[datetime, datetime]:
-    """Step a known reset instant forward in 7-day hops until it lands after now."""
-    period = timedelta(days=7)
-    if reset_at:
-        anchor = datetime.fromisoformat(reset_at)
-    else:
-        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        anchor = midnight - timedelta(days=midnight.weekday()) + period  # next UTC Monday
-    reset = anchor + period * math.ceil((now - anchor) / period)
-    if reset <= now:
-        reset += period
-    return reset - period, reset
-
-
-def _monthly_bounds(now: datetime, config: dict) -> tuple[datetime, datetime]:
-    """Calendar-stepped window anchored on a day-of-month (default: the 1st)."""
-    day = config.get("anchor_day", 1)
-    hour, minute = (int(part) for part in config.get("anchor_time", "00:00").split(":"))
-
-    def occurrence(year: int, month: int) -> datetime:
-        # Anchored on the 31st? Short months clamp to their last day.
-        clamped = min(day, monthrange(year, month)[1])
-        return datetime(year, month, clamped, hour, minute, tzinfo=timezone.utc)
-
-    def step(moment: datetime, months: int) -> datetime:
-        index = moment.year * 12 + (moment.month - 1) + months
-        return occurrence(index // 12, index % 12 + 1)
-
-    current = occurrence(now.year, now.month)
-    if current <= now:
-        return current, step(current, 1)
-    return step(current, -1), current
-
-
-# --------------------------------------------------------------------------- #
 # opencode - reading
 # --------------------------------------------------------------------------- #
 
 
 def opencode_data_dir() -> Path:
-    """Where OpenCode keeps its databases when no account overrides it."""
+    """Where OpenCode keeps its state when no account overrides it."""
     if env := os.environ.get("OPENCODE_DATA_DIR"):
         return Path(env)
     if xdg := os.environ.get("XDG_DATA_HOME"):
@@ -382,215 +267,182 @@ def opencode_data_dir() -> Path:
     return Path.home() / ".local" / "share" / "opencode"
 
 
-def _opencode_dbs(data_dir: Path) -> list[Path]:
-    # OpenCode partitions its database by release channel.
-    dbs = [p for p in (data_dir / "opencode.db", data_dir / "opencode-next.db") if p.exists()]
-    if not dbs:
-        raise ProviderError(f"no opencode database under {data_dir}")
-    return dbs
-
-
 def _opencode_auth(data_dir: Path) -> dict:
+    """auth.json holds the API keys opencode itself maintains, one per login."""
     try:
         return json.loads((data_dir / "auth.json").read_text())
     except (OSError, json.JSONDecodeError):
         return {}
 
 
-def _carried(window: str, config: dict, now: datetime) -> float:
-    """Spend inside this window that the local database cannot account for.
+def fetch_go_usage(account: Account, api_key: str) -> list[Record]:
+    """Ask opencode for the Go plan's own percentages.
 
-    A fresh data dir - a rebuilt box, a moved profile - leaves the console still
-    counting spend that never entered this database, so the local rollup is short
-    by a constant. Usage is affine in that constant, not proportional to it:
-    pct = (local + carried) / cap. Calibrating the cap alone silently assumes
-    carried == 0, which is what makes a fresh dir read 0% against a live console.
-
-    The offset is held in dollars, never percent, so refitting the cap later
-    cannot invalidate it. It expires at the instant the spend it stands for
-    leaves the window - `offset_until` - because past that reset the console has
-    dropped it too, and an offset that outlives its window is phantom spend.
-    A session block never carries one: it opens empty on the next message, so
-    there is no boundary in the past for missing spend to sit behind.
+    The plan is metered server-side - rolling 5h, weekly, monthly - and this
+    endpoint hands those counters over with their reset instants, so no window
+    is computed client-side at all. There is nothing to calibrate: these are
+    the numbers the console shows. A 403 means this workspace has no Go
+    subscription and yields no rows rather than an error - the Zen row, if
+    any, still belongs to this account.
     """
-    offset = config.get("offset")
-    if not offset or window == "session":
-        return 0.0
-    until = config.get("offset_until")
-    if until and now >= datetime.fromisoformat(until):
-        return 0.0
-    return float(offset)
-
-
-@dataclass
-class Spend:
-    """Local spend per provider per window, plus when the session window resets."""
-
-    totals: dict[str, dict[str, float]] = field(default_factory=dict)
-    session_reset: datetime | None = None  # None: no session block is open
-
-    def get(self, provider: str, window: str) -> float:
-        return self.totals.get(provider, {}).get(window, 0.0)
-
-
-def session_block(events: list[tuple[float, float]], span: float, now: datetime
-                  ) -> tuple[float, datetime | None]:
-    """Spend in the open session block, and the instant it expires.
-
-    The console's "rolling usage" does not slide: a block opens on the first
-    message sent while none is open, runs for a fixed `span`, and then drops
-    *whole*, taking spend only minutes old with it. Summing the last `span`
-    hours instead - as if the window slid - keeps counting an expired block's
-    tail, so the table reads high (and claims a reset) exactly when the console
-    has already gone back to 0%.
-
-    Blocks are therefore replayed forward: each message either falls inside the
-    open block or opens the next one. Only a message younger than `span` can
-    leave a block open, so a chain that starts mid-history still converges - and
-    every gap longer than `span` re-anchors it exactly.
-    """
-    anchor, used = None, 0.0
-    for created, cost in events:
-        if anchor is None or created >= anchor + span:
-            anchor, used = created, 0.0
-        used += cost
-    if anchor is None or now.timestamp() >= anchor + span:
-        return 0.0, None  # nothing open: the next message starts a fresh block
-    return used, datetime.fromtimestamp(anchor + span, timezone.utc)
-
-
-def read_spend(dbs: list[Path], bounds: dict[str, tuple[datetime, datetime | None]],
-               now: datetime) -> Spend:
-    spend = Spend(totals={"opencode-go": {}, "opencode": {}})
-    start_of = {window: start.timestamp() for window, (start, _) in bounds.items()}
-    floor_ms = int(min(start_of.values()) * 1000)
-    events: list[tuple[float, float]] = []
-    for db in dbs:
-        for created_ms, blob in _read_messages(db, floor_ms):
-            try:
-                message = json.loads(blob)
-            except json.JSONDecodeError:
-                continue
-            provider = message.get("providerID")
-            if provider not in spend.totals:
-                continue
-            cost = float(message.get("cost") or 0.0)
-            if not cost:
-                continue
-            created = created_ms / 1000
-            if provider == "opencode-go":
-                events.append((created, cost))
-            for window, start in start_of.items():
-                # session is a block, not a sum over the last N hours - see below.
-                if window != "session" and created >= start:
-                    totals = spend.totals[provider]
-                    totals[window] = totals.get(window, 0.0) + cost
-
-    # Blocks have to be replayed in order, and the databases are read one by one.
-    events.sort()
-    span = now.timestamp() - start_of["session"]
-    used, spend.session_reset = session_block(events, span, now)
-    spend.totals["opencode-go"]["session"] = used
-    return spend
-
-
-def _read_messages(db: Path, floor_ms: int):
-    """Read-only pull of every message since floor_ms. Never writes to the db."""
+    headers = {"Authorization": f"Bearer {api_key}"}
     try:
-        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5.0)
-    except sqlite3.Error as exc:
-        raise ProviderError(f"cannot open {db.name}: {exc}")
-    try:
-        conn.execute("PRAGMA query_only = 1")
-        yield from conn.execute(
-            "SELECT time_created, data FROM message WHERE time_created >= ?", (floor_ms,)
-        )
-    except sqlite3.Error as exc:
-        raise ProviderError(f"cannot read {db.name}: {exc}")
-    finally:
-        conn.close()
-
-
-def fetch_opencode(account: Account, calibration: dict) -> list[Record]:
-    """Roll up opencode's own per-message cost accounting into the plan windows."""
-    data_dir = account.folder
-    dbs = _opencode_dbs(data_dir)
-    auth = _opencode_auth(data_dir)
-    windows = calibration.get("windows", {})
-    age = _calibration_age(calibration)
-
-    now = datetime.now(timezone.utc)
-    bounds = window_bounds(now, calibration)
-    spend = read_spend(dbs, bounds, now)
+        response = httpx.get(ZEN_USAGE_URL, headers=headers, timeout=TIMEOUT)
+        response.raise_for_status()
+        data = response.json()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status == 401:
+            raise ProviderError(
+                f"Go API key rejected - run `{account.binary}` and reconnect Go with /connect"
+            )
+        if status == 403:
+            return []
+        raise ProviderError(f"HTTP {status} from {ZEN_USAGE_URL}")
+    except httpx.HTTPError as exc:
+        raise ProviderError(f"request failed: {exc}")
 
     records = []
-    if "opencode-go" in auth:
-        hours = windows.get("session", {}).get("hours", GO_SESSION_HOURS)
-        for window, label in (
-            ("session", f"go {hours}-hour"),
-            ("week", "go week"),
-            ("month", "go month"),
-        ):
-            config = windows.get(window, {})
-            cap = config.get("cap", DEFAULT_CAPS[window])
-            carried = _carried(window, config, now)
-            used = spend.get("opencode-go", window) + carried
-            # A closed session block resets on the next message, not at a knowable
-            # instant, so it reports no countdown at all rather than a made-up one.
-            resets = spend.session_reset if window == "session" else bounds[window][1]
-            records.append(
-                Record(
-                    account=account.name,
-                    provider="opencode",
-                    window=window,
-                    label=label,
-                    used=round(used, 4),
-                    limit=cap,
-                    unit="usd",
-                    pct=used / cap * 100 if cap else None,
-                    resets_at=resets.isoformat() if resets else None,
-                    source="local",
-                    calibrated="cap" in config,
-                    carried=round(carried, 4),
-                    note=f"calibrated {age}" if "cap" in config else "assumed cap, never calibrated",
-                )
-            )
-    if "opencode" in auth:
-        used = spend.get("opencode", "calendar_month")
+    for key, window, label in (
+        ("rolling", "session", f"go {GO_SESSION_HOURS}-hour"),
+        ("weekly", "week", "go week"),
+        ("monthly", "month", "go month"),
+    ):
+        block = (data.get("usage") or {}).get(key)
+        if not block:
+            continue
+        pct = float(block.get("percent", 0))
         records.append(
             Record(
                 account=account.name,
                 provider="opencode",
-                window="month",
-                label="zen month",
-                used=round(used, 4),
-                limit=None,
-                unit="usd",
-                pct=None,
-                resets_at=bounds["calendar_month"][1].isoformat(),
-                source="local",
-                note="pay-as-you-go, uncapped",
+                window=window,
+                label=label,
+                used=pct,
+                limit=100.0,
+                unit="percent",
+                pct=pct,
+                # Reset instants come straight from the server - no derived
+                # anchors, no countdown rounding to fudge. The 0% rolling block
+                # is the one exception: a closed block resets on the next
+                # message, not at a knowable instant, so it reports no
+                # countdown rather than the server's made-up "+5h".
+                resets_at=block.get("resetsAt") if (pct > 0 or window != "session") else None,
+                source="live",
             )
         )
-    if not records:
-        raise ProviderError(f"no opencode or opencode-go key in {data_dir / 'auth.json'}")
     return records
 
 
-def _calibration_days(calibration: dict) -> int | None:
-    stamp = calibration.get("calibrated_at")
-    if not stamp:
-        return None
-    return (datetime.now(timezone.utc) - datetime.fromisoformat(stamp)).days
+def _calendar_month(now: datetime) -> tuple[datetime, datetime]:
+    """(start, end) of the UTC month `now` sits in."""
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=monthrange(start.year, start.month)[1])
 
 
-def _calibration_age(calibration: dict) -> str:
-    days = _calibration_days(calibration)
-    if days is None:
-        return "never"
-    if days >= CALIBRATION_STALE_DAYS:
-        return f"{days}d ago, stale"
-    return "today" if days < 1 else f"{days}d ago"
+def _export_error(response: httpx.Response) -> str:
+    """Turn the export's error body into a sentence worth reading."""
+    try:
+        body = json.loads(response.text)
+        detail = body.get("message") or (body.get("error") or {}).get("message")
+    except (json.JSONDecodeError, AttributeError):
+        detail = None
+    if response.status_code == 401:
+        reason = detail or "service API key missing, invalid, expired or revoked"
+        return f"usage export rejected: {reason} - create a service account key in the console"
+    if response.status_code == 403:
+        return f"usage export rejected: {detail or 'this service account may not read usage'}"
+    return f"HTTP {response.status_code} from the usage export{': ' + detail if detail else ''}"
+
+
+def fetch_zen_spend(account: Account, service_key: str, console_url: str) -> Record:
+    """Roll the console's usage export up into Zen's calendar month.
+
+    The export streams the console's own accounting as CSV, newest first. Only
+    records charged to the pay-as-you-go balance count here - `credit` - plus
+    Web Search rows, which bill the same balance under their own service label.
+    BYOK and free usage carry no charge and Go-plan rows carry no dollars at
+    all, so nothing else can inflate the spend.
+    """
+    url = console_url.rstrip("/") + USAGE_EXPORT_PATH
+    headers = {"Authorization": f"Bearer {service_key}", "Accept": "text/csv"}
+    month_start, month_end = _calendar_month(datetime.now(timezone.utc))
+    micro_cents = 0
+    try:
+        with httpx.Client(timeout=TIMEOUT) as client:
+            with client.stream(
+                "GET", url, params={"scope": "organization", "range": EXPORT_RANGE}, headers=headers
+            ) as response:
+                if response.status_code != 200:
+                    response.read()
+                    raise ProviderError(_export_error(response))
+                for row in csv.DictReader(response.iter_lines()):
+                    if row.get("billing_source") == CREDIT_BILLING_SOURCE or row.get(
+                        "service"
+                    ) == WEB_SEARCH_SERVICE:
+                        created = row.get("created_at") or ""
+                        try:
+                            created_at = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        except (ValueError, TypeError):
+                            continue
+                        if created_at < month_start:
+                            continue
+                        try:
+                            micro_cents += int(row.get("cost_micro_cents") or 0)
+                        except (ValueError, TypeError):
+                            continue
+    except httpx.HTTPError as exc:
+        raise ProviderError(f"request failed: {exc}")
+    except csv.Error as exc:
+        raise ProviderError(f"cannot read the usage export: {exc}")
+    return Record(
+        account=account.name,
+        provider="opencode",
+        window="month",
+        label="zen month",
+        used=round(micro_cents / MICRO_CENTS_PER_DOLLAR, 4),
+        limit=None,
+        unit="usd",
+        pct=None,
+        resets_at=month_end.isoformat(),
+        source="live",
+        note="pay-as-you-go, uncapped",
+    )
+
+
+def fetch_opencode(account: Account) -> list[Record]:
+    """Read this account's numbers from opencode's own servers.
+
+    Go windows come from the usage endpoint, authenticated with the key
+    opencode already maintains in auth.json - read-only, like Claude Code's
+    credentials. Zen spend needs the console's usage export, which accepts
+    service account keys only, so an account without a service_key simply has
+    no Zen row. The two endpoints fail independently: whatever worked still
+    reports, with the failure named alongside it.
+    """
+    auth = _opencode_auth(account.folder)
+    records = []
+    problems = []
+    if go_key := (auth.get("opencode-go") or {}).get("key"):
+        try:
+            records.extend(fetch_go_usage(account, go_key))
+        except ProviderError as exc:
+            problems.append(f"Go usage: {exc}")
+    if account.service_key:
+        try:
+            records.append(fetch_zen_spend(account, account.service_key, account.console_url))
+        except ProviderError as exc:
+            problems.append(f"Zen spend: {exc}")
+    if not records:
+        if problems:
+            raise ProviderError("; ".join(problems))
+        raise ProviderError(
+            f"no opencode-go key in {account.folder / 'auth.json'} and no service_key "
+            "on this account - nothing to ask the server for"
+        )
+    if problems:
+        raise ProviderError("; ".join(problems), records=records)
+    return records
 
 
 # --------------------------------------------------------------------------- #
@@ -598,10 +450,10 @@ def _calibration_age(calibration: dict) -> str:
 # --------------------------------------------------------------------------- #
 #
 # A provider is code; an account is one login of it. Everything a provider needs
-# to tell one login from another lives in a folder - ~/.claude for Claude Code,
-# ~/.local/share/opencode for OpenCode - so an account is little more than a name
-# pointing at a folder. Adding a second Claude Code login is therefore a settings
-# entry, not a code change.
+# to tell one login from another lives either in a folder - ~/.claude for Claude
+# Code, ~/.local/share/opencode for OpenCode - or, for credentials the console
+# hands out separately, on the account itself: an OpenCode service_key. Adding a
+# second Claude Code login is therefore a settings entry, not a code change.
 
 PROVIDERS = {"claude": fetch_claude, "opencode": fetch_opencode}
 
@@ -652,8 +504,8 @@ def load_accounts() -> list[Account]:
     accounts: list[Account] = []
     for index, entry in enumerate(entries):
         account = _read_account(entry, f"{path} accounts[{index}]")
-        # Names key the calibration file and select on the command line, so a
-        # duplicate would silently point two logins at one set of caps.
+        # Names are what -a selects on and what downstream tools key off, so a
+        # duplicate would silently point two logins at one identity.
         if any(existing.name == account.name for existing in accounts):
             raise ConfigError(f"duplicate account name {account.name!r} in {path}")
         accounts.append(account)
@@ -680,12 +532,20 @@ def _read_account(entry: object, where: str) -> Account:
     exclude = entry.get("exclude", [])
     if not isinstance(exclude, list) or not all(isinstance(x, str) for x in exclude):
         raise ConfigError(f"{where}: 'exclude' must be a list of record labels")
+    service_key = entry.get("service_key")
+    if service_key is not None and not isinstance(service_key, str):
+        raise ConfigError(f"{where}: 'service_key' must be a string")
+    console_url = entry.get("console_url")
+    if console_url is not None and not isinstance(console_url, str):
+        raise ConfigError(f"{where}: 'console_url' must be a string")
     return Account(
         name=name,
         provider=provider,
         folder=_expand(folder) if folder else folder_default(),
         binary=str(entry.get("binary") or binary_default),
         exclude=tuple(exclude),
+        service_key=str(service_key or "").strip(),
+        console_url=str(console_url or DEFAULT_CONSOLE_URL),
     )
 
 
@@ -711,273 +571,6 @@ def select_accounts(accounts: list[Account], names: list[str] | None,
     if not chosen:
         raise ConfigError("no account matches those filters")
     return chosen
-
-
-def calibration_account(accounts: list[Account], name: str | None) -> Account:
-    """Which account `calibrate` is talking about. Only OpenCode has caps to fit."""
-    candidates = [account for account in accounts if account.provider == "opencode"]
-    if not candidates:
-        raise ConfigError("no opencode account configured - nothing to calibrate")
-    if name:
-        for account in candidates:
-            if account.name == name:
-                return account
-        raise ConfigError(
-            f"no opencode account named {name!r} - "
-            f"configured: {', '.join(a.name for a in candidates)}"
-        )
-    if len(candidates) > 1:
-        raise ConfigError(
-            "several opencode accounts configured - pick one with -a: "
-            + ", ".join(a.name for a in candidates)
-        )
-    return candidates[0]
-
-
-# --------------------------------------------------------------------------- #
-# calibrate command
-# --------------------------------------------------------------------------- #
-
-
-def fit_cap(percent: float, local: float, carried: float,
-            config: dict) -> tuple[float, float, float, str]:
-    """Solve for the cap a console reading implies over the spend it covers.
-
-    The console counts local + carried, never local alone, so a cap divided out
-    of local while the bar keeps adding the offset makes the table contradict
-    the reading it was just handed - hand it 100% and it prints 151%.
-
-    Carried dollars are not independent of the cap either: `--offset` solved
-    them against the cap this reading is about to discard. When that fit
-    recorded its own console percentage, the two readings are two equations in
-    two unknowns
-
-        pct_then * cap = local_then + carried
-        pct_now  * cap = local_now  + carried
-
-    and subtracting drops the carried term: cap = d_local / d_pct, owing
-    nothing to the cap being replaced. Carried follows from either row. Without
-    a usable earlier reading the carried dollars stand and only the cap moves.
-
-    Returns the cap, the carried spend that belongs with it, the local spend at
-    the earlier reading (for the caller to store), and which solve ran.
-    """
-    if not carried:
-        return local / (percent / 100), 0.0, 0.0, "plain"
-
-    prior, then = config.get("offset_pct"), config.get("offset_local")
-    if then is None and prior and "cap" in config:
-        # Calibrations written before offset_local carry it implicitly:
-        # fit_offsets solved offset = cap * pct - local, so this inverts exactly.
-        then = config["cap"] * prior / 100 - carried
-    if (then is None or not prior or percent - prior < MIN_READING_GAP
-            or local - then < MIN_CALIBRATION_SPEND):
-        return (local + carried) / (percent / 100), carried, 0.0, "held"
-
-    cap = (local - then) / ((percent - prior) / 100)
-    return cap, prior / 100 * cap - then, then, "paired"
-
-
-def calibrate(args) -> int:
-    accounts = load_accounts()
-    calibrations = load_calibration(accounts)
-
-    # `--show` without an account is the only whole-file view: everything at once.
-    if args.show and not args.account:
-        if not calibrations:
-            print("no calibration yet - run `calibrate --rolling N --weekly N --monthly N`")
-            return 0
-        print(json.dumps(calibrations, indent=2))
-        return 0
-
-    account = calibration_account(accounts, args.account)
-    calibration = calibrations.get(account.name, {})
-
-    if args.clear:
-        if not calibration:
-            print(f"{account.name} was never calibrated - nothing to clear")
-            return 0
-        calibrations.pop(account.name, None)
-        save_calibration(calibrations)
-        print(f"calibration cleared for {account.name} - back to assumed caps {DEFAULT_CAPS}")
-        return 0
-
-    if args.show:
-        if not calibration:
-            print(f"no calibration yet for {account.name} - "
-                  "run `calibrate --rolling N --weekly N --monthly N`")
-            return 0
-        print(json.dumps(calibration, indent=2))
-        return 0
-
-    observed = {w: getattr(args, flag) for w, flag in WINDOW_FLAGS.items() if getattr(args, flag) is not None}
-    if not observed:
-        print("nothing to calibrate - pass at least one of --rolling / --weekly / --monthly",
-              file=sys.stderr)
-        return 2
-
-    now = datetime.now(timezone.utc)
-    windows = calibration.setdefault("windows", {})
-    moved = []
-
-    # Anchors first: a cap derived over the wrong window is meaningless.
-    if args.weekly_resets:
-        reset = now + parse_duration(args.weekly_resets)
-        windows.setdefault("week", {})["reset_at"] = reset.isoformat()
-        moved.append(f"weekly window now resets {reset:%a %d %b %H:%M} UTC")
-    if args.monthly_resets:
-        reset = now + parse_duration(args.monthly_resets)
-        month = windows.setdefault("month", {})
-        month["anchor_day"], month["anchor_time"] = reset.day, f"{reset:%H:%M}"
-        moved.append(f"monthly window now anchored on day {reset.day} at {reset:%H:%M} UTC")
-
-    bounds = window_bounds(now, calibration)
-    spend = read_spend(_opencode_dbs(account.folder), bounds, now)
-
-    # One console reading cannot pin down both the cap and the carried offset, so
-    # each mode holds one fixed and solves for the other. Default: carried == 0,
-    # solve the cap. With --offset: the cap stands and the missing history is what
-    # gets measured, which is what a fresh data dir actually needs.
-    if args.offset:
-        return fit_offsets(account, calibration, calibrations, observed, bounds, spend, now, moved)
-
-    rows, skipped, coarse = [], [], []
-    for window, percent in observed.items():
-        local = spend.get("opencode-go", window)
-        config = windows.setdefault(window, {})
-        was = config.get("cap", DEFAULT_CAPS[window])
-        carried = _carried(window, config, now)
-        used = local + carried
-        if percent <= 0:
-            skipped.append(f"{window}: console reads 0% - nothing to divide into")
-            continue
-        if used < MIN_CALIBRATION_SPEND:
-            skipped.append(
-                f"{window}: only ${used:.2f} of local spend in this window "
-                f"(need ${MIN_CALIBRATION_SPEND:.2f}) - cap left at ${was:.2f}"
-            )
-            continue
-        cap, carried, then, mode = fit_cap(percent, local, carried, config)
-        config.update({
-            "cap": round(cap, 4),
-            "observed_pct": percent,
-            "local_spend": round(local, 4),
-            "at": now.isoformat(),
-        })
-        rows.append((window, local, carried, percent, cap, was))
-        if mode == "paired":
-            # Both were re-solved together, so the stored offset has to move with
-            # the cap - leaving the old dollars would reinstate the discarded cap.
-            config["offset"] = round(carried, 4)
-            config["offset_local"] = round(then, 4)
-            prior, gap = config["offset_pct"], percent - config["offset_pct"]
-            coarse.append(
-                f"{window}: solved against the {prior:.0f}% reading of "
-                f"{datetime.fromisoformat(config['offset_at']):%d %b} as well - "
-                f"{gap:.0f} points apart, so console rounding puts the cap within "
-                f"{100 / gap:.0f}%. ${carried:.2f} carried was refitted with it."
-            )
-        elif percent < 10:
-            # The console rounds to whole percent, so a small reading carries a
-            # large relative error: 6% is really 5.5-6.5%, i.e. +/-8% on the cap.
-            span = (used / (percent / 100 + 0.005), used / (percent / 100 - 0.005))
-            coarse.append(
-                f"{window}: {percent:.0f}% is a coarse reading - cap is somewhere in "
-                f"${span[0]:.2f}-${span[1]:.2f}. Recalibrate later in the window."
-            )
-
-    calibration["provider"] = "opencode-go"
-    calibration["calibrated_at"] = now.isoformat()
-    calibrations[account.name] = calibration
-    save_calibration(calibrations)
-
-    print(f"calibrated {account.name} against the OpenCode console "
-          f"at {now.astimezone():%Y-%m-%d %H:%M}\n")
-    if rows:
-        # The carried column earns its width only when something is carried;
-        # without it the fit is local against the console and a column of
-        # zeroes would just be noise.
-        carries = any(carried for _, _, carried, _, _, _ in rows)
-        held = f" {'carried':>9}" if carries else ""
-        print(f"  {'window':<8} {'local':>8}{held} {'console':>8} "
-              f"{'effective cap':>14} {'was':>9}")
-        for window, local, carried, percent, cap, was in rows:
-            amount = f" {'$%.2f' % carried:>9}" if carries else ""
-            print(f"  {window:<8} {'$%.2f' % local:>8}{amount} {'%.0f%%' % percent:>8} "
-                  f"{'$%.2f' % cap:>14} {'$%.2f' % was:>9}")
-    for line in moved:
-        print(f"\n  {line}")
-    for line in coarse:
-        print(f"\n  heads up {line}")
-    for line in skipped:
-        print(f"\n  skipped {line}")
-    print(f"\n  written to {CALIBRATION_FILE}")
-    if args.weekly_resets or args.monthly_resets:
-        print("  note: countdowns on the console are rounded, so derived anchors are +/- 1h")
-    return 0
-
-
-def fit_offsets(account: Account, calibration: dict, calibrations: dict, observed: dict,
-                bounds: dict, spend: Spend, now: datetime, moved: list[str]) -> int:
-    """Hold each cap and solve for the spend the local database cannot see.
-
-    Inverts the cap fit: `cap * pct == local + carried`, with cap known, so
-    carried is whatever the console is counting that this database is not.
-    """
-    windows = calibration.setdefault("windows", {})
-    rows, skipped = [], []
-    for window, percent in observed.items():
-        config = windows.setdefault(window, {})
-        if window == "session":
-            skipped.append("session: a block opens empty and expires whole - carries no offset")
-            continue
-        if "cap" not in config:
-            skipped.append(f"{window}: no measured cap to hold - fit the cap first, without --offset")
-            continue
-        cap, local = config["cap"], spend.get("opencode-go", window)
-        offset = cap * percent / 100 - local
-        if percent <= 0 or offset <= 0:
-            # Either the console agrees there is nothing in the window, or local
-            # spend already accounts for all of it. Both mean: carry nothing.
-            reason = ("console reads 0%" if percent <= 0
-                      else f"local ${local:.2f} already covers {percent:.0f}% of ${cap:.2f}")
-            had = config.pop("offset", None) is not None
-            config.pop("offset_until", None)
-            config.pop("offset_pct", None)
-            config.pop("offset_local", None)
-            config.pop("offset_at", None)
-            skipped.append(f"{window}: {reason} - {'offset cleared' if had else 'nothing carried'}")
-            continue
-        reset = bounds[window][1]
-        config.update({
-            "offset": round(offset, 4),
-            "offset_until": reset.isoformat(),
-            "offset_pct": percent,
-            "offset_local": round(local, 4),
-            "offset_at": now.isoformat(),
-        })
-        rows.append((window, local, percent, offset, cap, reset))
-
-    # Deliberately not touching `calibrated_at`: no cap was refitted here, and
-    # advancing it would report stale caps as fresh and mute the drift warning.
-    calibrations[account.name] = calibration
-    save_calibration(calibrations)
-
-    print(f"fitted carried spend for {account.name} against the OpenCode console "
-          f"at {now.astimezone():%Y-%m-%d %H:%M}\n")
-    if rows:
-        print(f"  {'window':<8} {'local':>8} {'console':>8} {'carried':>9} {'held cap':>9}  expires")
-        for window, local, percent, offset, cap, reset in rows:
-            print(f"  {window:<8} {'$%.2f' % local:>8} {'%.0f%%' % percent:>8} "
-                  f"{'$%.2f' % offset:>9} {'$%.2f' % cap:>9}  {reset:%a %d %b %H:%M} UTC")
-    for line in moved:
-        print(f"\n  {line}")
-    for line in skipped:
-        print(f"\n  skipped {line}")
-    print(f"\n  written to {CALIBRATION_FILE}")
-    if rows:
-        print("  carried spend expires with its window - this is not a permanent correction")
-    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -1014,41 +607,13 @@ def _until(iso: str | None) -> str:
     return f"{hours}h {minutes}m" if hours else f"{minutes}m"
 
 
-def _basis(rec: Record, ages: dict[str, str]) -> str:
-    """How much to trust this row: server-given, calibrated, or guessed."""
-    if rec.source == "live":
-        return ""
+def _basis(rec: Record) -> str:
+    """How much to trust this row: server-given, or pay-as-you-go."""
     if rec.limit is None:
         return "uncapped"
-    basis = f"cal {ages.get(rec.account, 'never')}" if rec.calibrated else "est"
-    # Never let carried spend hide inside the total: the bar matches the console,
-    # but only part of it is backed by rows in the local database.
-    return f"{basis}, incl ${rec.carried:.2f} carried" if rec.carried else basis
-
-
-def calibration_notice(account: Account, records: list[Record], calibration: dict) -> list[str]:
-    """Say out loud what the `est` marker only whispers.
-
-    An uncalibrated cap is not a rounding error - it has measured 3-4x too high,
-    which makes the bar read comfortably low exactly when it shouldn't. The
-    command comes with the account already filled in, so the fix is a paste.
-    """
-    capped = [
-        rec for rec in records
-        if rec.account == account.name and rec.source == "local" and rec.limit is not None
-    ]
-    if not capped:  # nothing here has a cap to be wrong about, e.g. Zen only
-        return []
-    if any(not rec.calibrated for rec in capped):
-        return [
-            "caps are assumed, not measured - typically 3-4x too high, so these read low.",
-            "Read the percentages off console.opencode.ai, then:",
-            f"./fumes.py calibrate -a {account.name} --rolling N --weekly N --monthly N",
-        ]
-    days = _calibration_days(calibration)
-    if days is not None and days >= CALIBRATION_STALE_DAYS:
-        return [f"calibration is {days}d old and drifts - recheck it against console.opencode.ai"]
-    return []
+    # Everything else is the server's own number - a percentage it computed or
+    # a charge it levied - so the row needs no disclaimer.
+    return ""
 
 
 def _heading(account: Account, color: bool) -> str:
@@ -1060,9 +625,7 @@ def _heading(account: Account, color: bool) -> str:
 
 
 def render_table(accounts: list[Account], records: list[Record],
-                 errors: list[tuple[Account, str]], color: bool,
-                 calibrations: dict[str, dict]) -> str:
-    ages = {name: _calibration_age(block) for name, block in calibrations.items()}
+                 errors: list[tuple[Account, str]], color: bool) -> str:
     cells = []
     for rec in records:
         cells.append((
@@ -1071,7 +634,7 @@ def render_table(accounts: list[Account], records: list[Record],
             f"{rec.pct:.0f}%" if rec.pct is not None else "",
             f"${rec.used:.2f}" if rec.unit == "usd" else "",
             f"resets in {_until(rec.resets_at)}" if rec.resets_at else "",
-            _basis(rec, ages),
+            _basis(rec),
             _color(rec.pct, color),
         ))
     widths = [max((len(cell[i]) for cell in cells), default=0) for i in range(6)]
@@ -1092,15 +655,11 @@ def render_table(accounts: list[Account], records: list[Record],
             )
         if message := failed.get(account.name):
             lines.append(f"  {RED if color else ''}{message}{RESET if color else ''}")
-        notice = calibration_notice(account, records, calibrations.get(account.name, {}))
-        for index, line in enumerate(notice):
-            tint, off = (YELLOW, RESET) if color else ("", "")
-            lines.append(f"  {tint}{'!' if index == 0 else ' '} {line}{off}")
     return "\n".join(lines) if lines else "nothing to report"
 
 
 def snapshot(accounts: list[Account], records: list[Record],
-             errors: list[tuple[Account, str]], calibrations: dict[str, dict]) -> dict:
+             errors: list[tuple[Account, str]]) -> dict:
     return {
         "ts": datetime.now(timezone.utc).isoformat(),
         "version": VERSION,
@@ -1109,31 +668,26 @@ def snapshot(accounts: list[Account], records: list[Record],
         ],
         "records": [asdict(r) for r in records],
         "errors": [{"account": a.name, "provider": a.provider, "message": m} for a, m in errors],
-        "calibrated_at": {
-            name: block.get("calibrated_at") for name, block in calibrations.items()
-        },
     }
 
 
 def report(args) -> int:
     configured = load_accounts()
-    # Ownership of a legacy calibration is positional, so it has to be resolved
-    # against every configured account: -a must not decide who inherits it.
-    calibrations = load_calibration(configured)
     accounts = select_accounts(configured, args.account, args.provider)
 
     records: list[Record] = []
     errors: list[tuple[Account, str]] = []
     for account in accounts:
         try:
-            fetched = PROVIDERS[account.provider](account, calibrations.get(account.name, {}))
+            fetched = PROVIDERS[account.provider](account)
             # An account's exclude list drops records by label, so a login can
             # carry a subscription whose numbers this output should not report.
             records.extend(r for r in fetched if r.label not in account.exclude)
         except ProviderError as exc:
             errors.append((account, str(exc)))
+            records.extend(r for r in exc.records if r.label not in account.exclude)
 
-    payload = snapshot(accounts, records, errors, calibrations)
+    payload = snapshot(accounts, records, errors)
     if not args.no_history:
         with HISTORY_FILE.open("a") as handle:
             handle.write(json.dumps(payload) + "\n")
@@ -1141,7 +695,7 @@ def report(args) -> int:
     if args.json:
         print(json.dumps(payload, indent=2))
     else:
-        print(render_table(accounts, records, errors, sys.stdout.isatty(), calibrations))
+        print(render_table(accounts, records, errors, sys.stdout.isatty()))
     return 1 if errors and not records else 0
 
 
@@ -1158,20 +712,6 @@ def main() -> int:
     show.add_argument("--json", action="store_true", help="emit normalized records")
     show.add_argument("--no-history", action="store_true", help="skip the history.jsonl snapshot")
     show.set_defaults(func=report)
-
-    fit = sub.add_parser("calibrate", help="fit OpenCode Go caps to the console's percentages")
-    fit.add_argument("-a", "--account", help="which opencode account (needed if you have several)")
-    fit.add_argument("--rolling", type=float, help="rolling-window %% shown on the console")
-    fit.add_argument("--weekly", type=float, help="weekly %% shown on the console")
-    fit.add_argument("--monthly", type=float, help="monthly %% shown on the console")
-    fit.add_argument("--weekly-resets", metavar="DUR", help="its weekly countdown, e.g. '5d 21h'")
-    fit.add_argument("--monthly-resets", metavar="DUR", help="its monthly countdown, e.g. '30d 23h'")
-    fit.add_argument("--offset", action="store_true",
-                     help="hold the measured caps and fit the spend the local db cannot see "
-                          "(for a fresh data dir, where the console counts history it never had)")
-    fit.add_argument("--show", action="store_true", help="print the stored calibration")
-    fit.add_argument("--clear", action="store_true", help="forget it and use assumed caps")
-    fit.set_defaults(func=calibrate)
 
     # No subcommand (or only flags) means `report` - but leave the parser's own
     # flags alone, so that bare --help lists the subcommands instead of just

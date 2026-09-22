@@ -9,15 +9,15 @@ claude
   5-hour session  ██████████░░░░░░  60%         resets in 3h 42m
   7-day           █████░░░░░░░░░░░  34%         resets in 1d 2h
 opencode
-  go 5-hour       ███████░░░░░░░░░  42%  $1.15  resets in 4h 32m   cal today
-  go week         ██████████████░░  87%  $6.79  resets in 5d 20h   cal today
-  go month        █░░░░░░░░░░░░░░░   6%  $1.15  resets in 30d 22h  cal today
-  zen month       ----------------       $0.13  resets in 27d 21h  uncapped
+  go 5-hour       █████░░░░░░░░░░░  23%         resets in 1h 32m
+  go week         ████████░░░░░░░░  46%         resets in 5d 19h
+  go month        ███████████████░  89%         resets in 11d 21h
+  zen month       ----------------       $0.26  resets in 9d 20h   uncapped
 ```
 
-The last column is how much to trust the row: nothing for Claude (the server said
-so), `cal <age>` for a calibrated OpenCode window, `est` for one still on assumed
-caps, `uncapped` for pay-as-you-go.
+Every row is the provider's own number: a percentage the server computed, or a
+charge it levied. The only marker is `uncapped`, for pay-as-you-go spend that
+no limit governs.
 
 ## Install
 
@@ -103,19 +103,23 @@ Code login, two OpenCode data dirs. Copy `settings.example.json` to
 |---|---|
 | `name` | What the table calls it and what `-a` selects. Must be unique, and must match `[A-Za-z0-9][A-Za-z0-9_-]*` — see below. |
 | `provider` | `claude` or `opencode`. The adapter that knows how to read the folder. |
-| `folder` | Where that provider keeps its state — Claude Code's config dir (holding `.credentials.json`), OpenCode's data dir (holding `auth.json` and `opencode*.db`). `~` and `$VARS` expand. |
+| `folder` | Where that provider keeps its state — Claude Code's config dir (holding `.credentials.json`), OpenCode's data dir (holding `auth.json`). `~` and `$VARS` expand. |
 | `binary` | The CLI that owns the folder. **Never executed** — it appears in hints, e.g. which command to run to refresh an expired token. |
+| `service_key` | OpenCode only: a **service account key** from [console.opencode.ai](https://console.opencode.ai) (`oc_sk_...`). Unlocks the Zen spend row. Go-plan rows never need it. |
+| `console_url` | OpenCode only: where the usage export lives. Defaults to `https://opencode.ai/console`. |
 
-Only `provider` is required; the rest fall back to that provider's defaults.
-Everything an account needs to be told apart lives in its folder, so a second
-login is a settings entry, not a code change.
+Only `provider` is required; the rest fall back to defaults. An OpenCode account
+needs no key of its own for the Go rows — fumes reuses the API key opencode
+keeps in `auth.json` — but a `service_key` is what unlocks the Zen row, because
+the console's usage export accepts service account keys only. Without one that
+row is simply absent, not an error.
 
-The name is an identifier, not a label. It keys `calibration.json`, and tools
-that read this one's output put it into dotted key paths
-(`data.by_account.claude.records.0.pct`) and into the regexes that match them —
-so a dot would split the path and a space or a `(` would break the match. Names
-are checked when the settings file loads and anything outside
-`[A-Za-z0-9][A-Za-z0-9_-]*` is rejected with the offending entry named:
+The name is an identifier, not a label. Tools that read this one's output put it
+into dotted key paths (`data.by_account.claude.records.0.pct`) and into the
+regexes that match them — so a dot would split the path and a space or a `(`
+would break the match. Names are checked when the settings file loads and
+anything outside `[A-Za-z0-9][A-Za-z0-9_-]*` is rejected with the offending
+entry named:
 
 ```
 error: /home/you/.config/fumes/settings.json accounts[1]: account name
@@ -139,7 +143,8 @@ claude-work (claude)
 claude-old (claude)
   OAuth token expired at 22:16 - run `CLAUDE_CONFIG_DIR=/home/you/.claude-old claude` to refresh
 opencode (opencode)
-  go 5-hour       ██████░░░░░░░░░░   35%  $0.96  resets in 4h 4m    cal today
+  go 5-hour       ██████░░░░░░░░░░   35%         resets in 4h 4m
+  zen month       ----------------       $0.96  resets in 12d 3h   uncapped
 ```
 
 The heading is the account name; the provider follows in parentheses unless the
@@ -150,103 +155,56 @@ name already is the provider.
 | Provider | Source | Reads |
 |---|---|---|
 | `claude` | **live** | `GET api.anthropic.com/api/oauth/usage` with the token in `<folder>/.credentials.json` (default `$CLAUDE_CONFIG_DIR`, else `~/.claude`) |
-| `opencode` | **local** | `<folder>/opencode*.db` (default `$OPENCODE_DATA_DIR`, else `$XDG_DATA_HOME/opencode`, else `~/.local/share/opencode`) |
+| `opencode` | **live** | `GET opencode.ai/zen/go/v1/usage` with the Go API key in `<folder>/auth.json` (default `$OPENCODE_DATA_DIR`, else `$XDG_DATA_HOME/opencode`, else `~/.local/share/opencode`); plus, with a `service_key`, the console's `GET /api/v1/usage/export` CSV for Zen spend |
 
 **Claude** reuses the OAuth token Claude Code already maintains. That file is read
 **read-only** on purpose: Claude Code owns it and refreshes the ~3h token on use,
 so refreshing here would race a running agent. An expired token is reported, not
 repaired — run any Claude Code command and try again.
 
-**OpenCode** has no usage API. Verified against a live account: `/usage`,
-`/account`, and `/billing` all 404 on `opencode.ai`, `api.opencode.ai`, and
-`console.opencode.ai`; a real completion against `zen/go/v1` comes back with no
-`x-ratelimit-*` headers; the Zen docs list only `/models`, `/responses`,
-`/messages`, `/chat/completions`. So spend is rolled up from opencode's own
-`message` table (`providerID`, `cost`, `time_created`) — the approach
-[openusage](https://github.com/robinebers/openusage) documents. The database is
-opened `mode=ro` with `PRAGMA query_only = 1`.
+**OpenCode** reads two things, both live:
 
-## Calibration
+- **Go plan** — `GET /zen/go/v1/usage` returns the console's own counters: the
+  rolling 5-hour, weekly and monthly percentages with their reset instants. It
+  accepts the regular Go API key opencode maintains in `auth.json`, so there is
+  nothing to configure and nothing to calibrate — the server computed the
+  percentage, so the client shows it. A workspace without a Go subscription
+  gets a 403 and simply no Go rows.
+- **Zen pay-as-you-go** — the [usage export](https://opencode.ai/console/guides/usage)
+  streams a workspace's usage records as CSV (`scope=organization&range=30d`).
+  It accepts **service account keys only** — create one in the console, put it
+  on the account as `service_key`. Records charged to the balance
+  (`billing_source=credit`) plus Web Search rows roll up into the calendar
+  month; Go-plan rows carry no dollars (the plan meters its own
+  dollar-equivalents the CSV never exposes), and BYOK and free usage carry no
+  charge, so neither can inflate the spend.
 
-The local rollup and the OpenCode console disagree — badly. Measured against
-console readings of 42% / 87% / 6%:
+Earlier versions rolled OpenCode spend up from its local SQLite `message` table
+and fitted caps to console readings because no usage API existed. One does now,
+so that machinery — `calibrate`, `calibration.json`, assumed caps, carried
+offsets — is gone. Your `calibration.json`, if you have one, is no longer read;
+delete it whenever you like.
 
-| Window | Community-quoted cap | Effective cap | Off by |
-|---|---|---|---|
-| Rolling 5h | $12.00 | $2.74 | 4.4× |
-| Weekly | $30.00 | $7.80 | 3.8× |
-| Monthly | $60.00 | $19.15 | 3.1× |
-
-Two structural reasons: the Go plan isn't metered at opencode's local cost rates,
-and usage from any *other* machine never reaches this database. The monthly
-*window* was wrong too — it's billing-anchored (resets on a fixed day of the
-month), not calendar.
-
-So don't assume the caps, measure them. Read the percentages off the console and
-hand them over:
-
-```bash
-./fumes.py calibrate --rolling 42 --weekly 87 --monthly 6 \
-    --weekly-resets "5d 21h" --monthly-resets "30d 23h"
-./fumes.py calibrate --show          # what's stored, for every account
-./fumes.py calibrate --clear         # back to assumed caps
-./fumes.py calibrate -a work ...     # which account you're reading off the console
-```
-
-Calibration is **per account**: two OpenCode logins are metered separately and
-each console shows its own percentages, so each gets its own caps and window
-anchors. `-a` is optional while only one OpenCode account is configured, and
-required once there are several. `--show` without `-a` prints them all.
-
-Each percentage is divided into the spend the console is counting for that
-window — local, plus anything `--offset` has recorded as carried — to get the
-**effective cap**, the local-dollar figure that reproduces the console's number.
-Where a carried figure exists it was itself fitted against the cap now being
-replaced, so if it came with its own console reading the two readings are solved
-together and both move: `cap = Δlocal / Δpct`, owing nothing to the discarded
-cap. The optional countdowns move the window boundaries, and are applied
-*first*: a cap fitted over the wrong window is meaningless. Results land in
-`calibration.json`.
-
-Until you do, the table says so under the account's rows — an uncalibrated cap
-isn't a rounding error, it has measured 3–4× too high, which makes the bar read
-comfortably low exactly when it shouldn't:
-
-```
-fresh-install (opencode)
-  go 5-hour  █░░░░░░░░░░░░░░░   8%   $0.96  resets in 3h 49m   est
-  ! caps are assumed, not measured - typically 3-4x too high, so these read low.
-    Read the percentages off console.opencode.ai, then:
-    ./fumes.py calibrate -a fresh-install --rolling N --weekly N --monthly N
-```
-
-That same $0.96, against caps fitted to a real console reading, is **35%**. A
-calibration older than 14 days gets its own line asking you to recheck it.
-
-Guard rails, because this is a fit to a single observation:
-
-- A window holding less than **$0.25** of local spend is skipped — dividing a
-  percentage into near-zero spend gives a garbage cap.
-- A reading below **10%** prints the range it actually implies (6% means 5.5–6.5%,
-  so ±8% on the cap) and suggests recalibrating later in the window.
-- Console countdowns are rounded, so derived anchors carry ±1h.
-- Every row shows its calibration age; after 14 days it says `stale`.
-
-**It drifts.** Recalibrate whenever the table and the console disagree.
+Earlier versions rolled OpenCode spend up from its local SQLite `message` table
+and fitted caps to console readings because no usage API existed. One does now,
+so that machinery — `calibrate`, `calibration.json`, assumed caps, carried
+offsets — is gone. Your `calibration.json`, if you have one, is no longer read;
+delete it whenever you like.
 
 ## Data and privacy
 
-Nothing leaves your machine except one request to `api.anthropic.com` — the
-issuer of the token it sends. No telemetry, no third parties.
+Nothing leaves your machine except requests to the issuers of the credentials it
+sends: `api.anthropic.com` for Claude, `opencode.ai` for OpenCode (one or two
+requests per run — the usage endpoint, and the export CSV when a `service_key`
+is configured). No telemetry, no third parties.
 
-Three local files, all gitignored:
+Two local files, both gitignored:
 
-- `history.jsonl` — one snapshot per report run. Kept because the Claude
-  percentages exist nowhere else once a window rolls.
-- `calibration.json` — the fitted caps and window anchors, keyed by account. See
-  `calibration.example.json`.
-- `settings.json` — your account list. Paths and login names, no secrets, but
-  personal. See `settings.example.json`.
+- `history.jsonl` — one snapshot per report run. Kept because the percentages
+  exist nowhere else once a window rolls.
+- `settings.json` — your account list. Paths and login names, but personal —
+  and a `service_key` is a credential, so keep the file out of anything you
+  share or sync. See `settings.example.json`.
 
 Credentials are read at call time, used in an `Authorization` header, and never
 written to either file or to any error message.
@@ -255,16 +213,23 @@ written to either file or to any error message.
 
 - `api.anthropic.com/api/oauth/usage` is **undocumented**. It works today; it can
   change or disappear without notice.
-- The OpenCode rollup depends on their SQLite schema, which is likewise not a
-  public contract. It reads `opencode.db` and `opencode-next.db`.
-- The Go plan caps in `DEFAULT_CAPS` are community-observed starting points and
-  are — as the table above shows — wrong. Calibrate.
+- Same for `opencode.ai/zen/go/v1/usage` — the percentages are the console's own
+  counters, but the endpoint isn't in the docs. The usage export, by contrast,
+  is documented and versioned (`/api/v1/usage/export`).
+- The export's ranges start at midnight UTC, and `30d` is the widest — which
+  still covers the whole current calendar month, so the Zen row never clips. The
+  Go windows need nothing from the CSV at all.
+- The Go percentages arrive floored to whole percents; a bar can read one point
+  lower than the console if you check them between requests.
 - Only Claude and OpenCode so far. Adding a provider means one function returning
   `Record`s plus an entry in `PROVIDERS` and `PROVIDER_DEFAULTS`; adding another
   *account* of an existing provider is settings only.
 - The default Claude account now follows `$CLAUDE_CONFIG_DIR` when it is set,
   where it used to always read `~/.claude`. If your shell exports it, that's the
   account you'll see — name both folders in `settings.json` to see both.
+- v0.6 changed the `--json` shape: records lost `calibrated` and `carried`, and
+  OpenCode Go rows are percent-native (`unit: "percent"`, `limit: 100`) instead
+  of dollar-native. The version is stamped into every `history.jsonl` line.
 
 ## License
 

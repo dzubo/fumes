@@ -1,5 +1,5 @@
 {
-  "_comment": "Account names are identifiers - they key calibration.json and appear in the key paths and regexes of tools that read fumes' output - so they must match [A-Za-z0-9][A-Za-z0-9_-]*: no dots, spaces or punctuation.",
+  "_comment": "Account names are identifiers - they key the dotted key paths and regexes of tools that read fumes' output - so they must match [A-Za-z0-9][A-Za-z0-9_-]*: no dots, spaces or punctuation.",
   "accounts": [
     {
       "name": "claude",
@@ -18,7 +18,9 @@
       "provider": "opencode",
       "folder": "~/.local/share/opencode",
       "binary": "opencode",
+      "service_key": "oc_sk_...",
       "exclude": ["zen month"]
     }
-  ]
+  ],
+  "_comment2": "Go-plan percentages need no key of their own: fumes reuses the API key opencode keeps in auth.json. The service_key - a service account key from console.opencode.ai - is what unlocks the Zen spend row; without one that row is simply absent. console_url only matters with a service_key, and only if the export lives somewhere other than https://opencode.ai/console."
 }

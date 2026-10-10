@@ -59,7 +59,7 @@ TIMEOUT = 15.0
 
 # Stamped into every history.jsonl snapshot: the file has already changed shape
 # twice, so a reader shouldn't have to sniff which version wrote a given line.
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 CLAUDE_CREDENTIALS_NAME = ".credentials.json"
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -70,23 +70,24 @@ CLAUDE_BETA = "oauth-2025-04-20"
 # Code's credentials. Undocumented endpoint: works today, can change.
 ZEN_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
 
-# Zen spend comes from the console's usage export (documented:
-# opencode.ai/console/guides/usage). Service account keys only; ranges start at
-# midnight UTC, and 30d is the widest - which still covers the whole current
-# calendar month, so the Zen row never needs a longer window.
+# Zen spend comes from the console's usage export (v2, documented in the
+# console's own API schema: "Daily usage export for organization admins and
+# service accounts"). Service account keys only; ranges start at midnight UTC,
+# and 30d is the widest - which still covers the whole current calendar month,
+# so the Zen row never needs a longer window. The v1 org-wide export
+# (/api/v1/usage/export) was deprecated in September 2026: organizations moved
+# to v2 start receiving 403 from it, with no visible signal beyond that.
 DEFAULT_CONSOLE_URL = "https://opencode.ai/console"
-USAGE_EXPORT_PATH = "/api/v1/usage/export"
+USAGE_EXPORT_PATH = "/api/v2/usage/export"
 EXPORT_RANGE = "30d"
 
 GO_SESSION_HOURS = 5
 
-# The CSV tags each record with how it was funded. Go-plan rows say `go` (and
-# carry zero charge - the plan meters its own dollar-equivalents the CSV never
-# sees); pay-as-you-go rows say `credit`. Web Search charges ride along on
-# org-wide exports under their own service label.
-GO_BILLING_SOURCE = "go"
-CREDIT_BILLING_SOURCE = "credit"
-WEB_SEARCH_SERVICE = "web-search"
+# The v2 daily CSV splits usage by provider. Go-plan usage says `opencode-go` -
+# the plan meters its own dollar-equivalents the CSV never sees, so those rows
+# are skipped wholesale. Pay-as-you-go Zen spend says `opencode`; free models
+# carry zero cost there, so nothing else can inflate the rollup.
+PAYG_PROVIDER = "opencode"
 
 # 100,000,000 micro-cents is one dollar - the export's own convention.
 MICRO_CENTS_PER_DOLLAR = 100_000_000
@@ -352,17 +353,19 @@ def _export_error(response: httpx.Response) -> str:
         return f"usage export rejected: {reason} - create a service account key in the console"
     if response.status_code == 403:
         return f"usage export rejected: {detail or 'this service account may not read usage'}"
+    if response.status_code == 503:
+        return "usage export unavailable: daily rollups not ready yet - try again later"
     return f"HTTP {response.status_code} from the usage export{': ' + detail if detail else ''}"
 
 
 def fetch_zen_spend(account: Account, service_key: str, console_url: str) -> Record:
     """Roll the console's usage export up into Zen's calendar month.
 
-    The export streams the console's own accounting as CSV, newest first. Only
-    records charged to the pay-as-you-go balance count here - `credit` - plus
-    Web Search rows, which bill the same balance under their own service label.
-    BYOK and free usage carry no charge and Go-plan rows carry no dollars at
-    all, so nothing else can inflate the spend.
+    The v2 export streams daily rollups as CSV, newest day first: one row per
+    UTC day, member or service account, provider and model. Only `opencode`
+    provider rows are charged to the pay-as-you-go balance - free models
+    (e.g. `*-contributor-free`, `big-pickle`) carry zero cost, so they cannot
+    inflate the spend, and Go-plan rows are skipped wholesale.
     """
     url = console_url.rstrip("/") + USAGE_EXPORT_PATH
     headers = {"Authorization": f"Bearer {service_key}", "Accept": "text/csv"}
@@ -371,26 +374,24 @@ def fetch_zen_spend(account: Account, service_key: str, console_url: str) -> Rec
     try:
         with httpx.Client(timeout=TIMEOUT) as client:
             with client.stream(
-                "GET", url, params={"scope": "organization", "range": EXPORT_RANGE}, headers=headers
+                "GET", url, params={"range": EXPORT_RANGE}, headers=headers
             ) as response:
                 if response.status_code != 200:
                     response.read()
                     raise ProviderError(_export_error(response))
                 for row in csv.DictReader(response.iter_lines()):
-                    if row.get("billing_source") == CREDIT_BILLING_SOURCE or row.get(
-                        "service"
-                    ) == WEB_SEARCH_SERVICE:
-                        created = row.get("created_at") or ""
-                        try:
-                            created_at = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                        except (ValueError, TypeError):
-                            continue
-                        if created_at < month_start:
-                            continue
-                        try:
-                            micro_cents += int(row.get("cost_micro_cents") or 0)
-                        except (ValueError, TypeError):
-                            continue
+                    if row.get("provider") != PAYG_PROVIDER:
+                        continue
+                    try:
+                        day = datetime.fromisoformat(row["day"]).replace(tzinfo=timezone.utc)
+                    except (KeyError, ValueError):
+                        continue
+                    if day < month_start:
+                        continue
+                    try:
+                        micro_cents += int(row.get("cost_micro_cents") or 0)
+                    except (ValueError, TypeError):
+                        continue
     except httpx.HTTPError as exc:
         raise ProviderError(f"request failed: {exc}")
     except csv.Error as exc:

@@ -155,7 +155,7 @@ name already is the provider.
 | Provider | Source | Reads |
 |---|---|---|
 | `claude` | **live** | `GET api.anthropic.com/api/oauth/usage` with the token in `<folder>/.credentials.json` (default `$CLAUDE_CONFIG_DIR`, else `~/.claude`) |
-| `opencode` | **live** | `GET opencode.ai/zen/go/v1/usage` with the Go API key in `<folder>/auth.json` (default `$OPENCODE_DATA_DIR`, else `$XDG_DATA_HOME/opencode`, else `~/.local/share/opencode`); plus, with a `service_key`, the console's `GET /api/v1/usage/export` CSV for Zen spend |
+| `opencode` | **live** | `GET opencode.ai/zen/go/v1/usage` with the Go API key in `<folder>/auth.json` (default `$OPENCODE_DATA_DIR`, else `$XDG_DATA_HOME/opencode`, else `~/.local/share/opencode`); plus, with a `service_key`, the console's `GET /api/v2/usage/export` CSV for Zen spend |
 
 **Claude** reuses the OAuth token Claude Code already maintains. That file is read
 **read-only** on purpose: Claude Code owns it and refreshes the ~3h token on use,
@@ -170,20 +170,17 @@ repaired — run any Claude Code command and try again.
   nothing to configure and nothing to calibrate — the server computed the
   percentage, so the client shows it. A workspace without a Go subscription
   gets a 403 and simply no Go rows.
-- **Zen pay-as-you-go** — the [usage export](https://opencode.ai/console/guides/usage)
-  streams a workspace's usage records as CSV (`scope=organization&range=30d`).
-  It accepts **service account keys only** — create one in the console, put it
-  on the account as `service_key`. Records charged to the balance
-  (`billing_source=credit`) plus Web Search rows roll up into the calendar
-  month; Go-plan rows carry no dollars (the plan meters its own
-  dollar-equivalents the CSV never exposes), and BYOK and free usage carry no
-  charge, so neither can inflate the spend.
-
-Earlier versions rolled OpenCode spend up from its local SQLite `message` table
-and fitted caps to console readings because no usage API existed. One does now,
-so that machinery — `calibrate`, `calibration.json`, assumed caps, carried
-offsets — is gone. Your `calibration.json`, if you have one, is no longer read;
-delete it whenever you like.
+- **Zen pay-as-you-go** — the console's v2
+  [usage export](https://opencode.ai/console/guides/usage) (`/api/v2/usage/export`,
+  `range=30d`) streams daily rollups as CSV: one row per UTC day, member or
+  service account, provider and model. It accepts **service account keys only** —
+  create one in the console, put it on the account as `service_key`. Rows whose
+  provider is `opencode` are charged to the balance and roll up into the calendar
+  month; Go-plan rows (`provider=opencode-go`) carry no dollars (the plan meters
+  its own dollar-equivalents the CSV never exposes), and free models carry zero
+  cost, so neither can inflate the spend. The v1 org-wide export
+  (`/api/v1/usage/export`) was deprecated in September 2026 — organizations
+  moved to v2 get a bare 403 from it.
 
 Earlier versions rolled OpenCode spend up from its local SQLite `message` table
 and fitted caps to console readings because no usage API existed. One does now,
@@ -218,7 +215,9 @@ written to either file or to any error message.
   is documented and versioned (`/api/v1/usage/export`).
 - The export's ranges start at midnight UTC, and `30d` is the widest — which
   still covers the whole current calendar month, so the Zen row never clips. The
-  Go windows need nothing from the CSV at all.
+  Go windows need nothing from the CSV at all. The v2 export reports daily
+  rollups, which can lag the most recent requests by a little; it answers 503
+  until the day's rollup exists.
 - The Go percentages arrive floored to whole percents; a bar can read one point
   lower than the console if you check them between requests.
 - Only Claude and OpenCode so far. Adding a provider means one function returning
@@ -230,6 +229,10 @@ written to either file or to any error message.
 - v0.6 changed the `--json` shape: records lost `calibrated` and `carried`, and
   OpenCode Go rows are percent-native (`unit: "percent"`, `limit: 100`) instead
   of dollar-native. The version is stamped into every `history.jsonl` line.
+- September 2026: OpenCode moved usage exports to `/api/v2/usage/export` and
+  began 403-ing the v1 org-wide endpoint. v0.6.1 follows the v2 CSV — the Zen
+  row now sums `provider=opencode` rows from the daily rollups instead of
+  `billing_source=credit` rows from the deprecated export.
 
 ## License
 
